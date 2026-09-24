@@ -48,6 +48,22 @@ items that applications should need to reference, in order to parse and check ta
 
 .. autofunction:: create_compatible_tags_selector
 
+.. autoclass:: TargetEnvironment
+   :members:
+
+.. autoclass:: LinuxTarget
+   :members:
+
+.. autoclass:: MacOSTarget
+   :members:
+
+.. autoclass:: ExplicitTarget
+   :members:
+
+.. autoexception:: IncompleteTargetError
+
+.. autoexception:: ContradictoryTargetError
+
 .. autoexception:: TooManyTagsError
 
 .. autoexception:: UnsortedTagsError

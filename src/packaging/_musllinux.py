@@ -56,7 +56,9 @@ def _get_musl_version(executable: str) -> _MuslVersion | None:
     return _parse_musl_version(proc.stderr)
 
 
-def platform_tags(archs: Sequence[str]) -> Iterator[str]:
+def platform_tags(
+    archs: Sequence[str], *, musl_version: _MuslVersion | None = None
+) -> Iterator[str]:
     """Generate musllinux tags compatible to the current platform.
 
     :param archs: Sequence of compatible architectures.
@@ -64,15 +66,20 @@ def platform_tags(archs: Sequence[str]) -> Iterator[str]:
         platform tag after the ``linux_`` prefix, e.g. ``x86_64``.
         The ``linux_`` prefix is assumed as a prerequisite for the current platform to
         be musllinux-compatible.
+    :param musl_version: The musl version of the target platform. When
+        ``None`` (the default), the version is detected from the running
+        executable. When provided, the version is trusted as-is, allowing
+        tags to be generated for a machine other than the current one.
 
     :returns: An iterator of compatible musllinux tags.
     """
-    sys_musl = _get_musl_version(sys.executable)
-    if sys_musl is None:  # Python not dynamically linked against musl.
-        return
+    if musl_version is None:
+        musl_version = _get_musl_version(sys.executable)
+        if musl_version is None:  # Python not dynamically linked against musl.
+            return
     for arch in archs:
-        for minor in range(sys_musl.minor, -1, -1):
-            yield f"musllinux_{sys_musl.major}_{minor}_{arch}"
+        for minor in range(musl_version.minor, -1, -1):
+            yield f"musllinux_{musl_version.major}_{minor}_{arch}"
 
 
 if __name__ == "__main__":  # pragma: no cover

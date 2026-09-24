@@ -95,3 +95,22 @@ def test_get_musl_version(
     else:
         expected_calls = []
     assert run_recorder.calls == expected_calls
+
+
+def test_platform_tags_explicit_musl_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Host detection must not be consulted when a version is given.
+    monkeypatch.setattr(
+        _musllinux,
+        "_get_musl_version",
+        lambda _: pytest.fail("host musl detected"),
+    )
+    result = list(
+        _musllinux.platform_tags(["aarch64"], musl_version=_MuslVersion(1, 2))
+    )
+    assert result == [
+        "musllinux_1_2_aarch64",
+        "musllinux_1_1_aarch64",
+        "musllinux_1_0_aarch64",
+    ]

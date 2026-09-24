@@ -210,3 +210,27 @@ def test_parse_elf_bad_executable(content: str | None) -> None:
     # None is not supported in the type annotation, but it was tested before.
     with _parse_elf(path_str) as ef:  # type: ignore[arg-type]
         assert ef is None
+
+
+def test_platform_tags_explicit_glibc_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Host detection must not be consulted when a version is given.
+    monkeypatch.setattr(
+        _manylinux, "_have_compatible_abi", lambda *a: pytest.fail("host ABI checked")
+    )
+    monkeypatch.setattr(
+        _manylinux,
+        "_get_glibc_version",
+        lambda: pytest.fail("host glibc detected"),
+    )
+    result = list(
+        _manylinux.platform_tags(["x86_64"], glibc_version=_GLibCVersion(2, 17))
+    )
+    assert result[:4] == [
+        "manylinux_2_17_x86_64",
+        "manylinux2014_x86_64",
+        "manylinux_2_16_x86_64",
+        "manylinux_2_15_x86_64",
+    ]
+    assert result[-2:] == ["manylinux_2_5_x86_64", "manylinux1_x86_64"]

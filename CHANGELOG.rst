@@ -4,6 +4,17 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :class:`~packaging.tags.TargetEnvironment` (together with
+  :class:`~packaging.tags.LinuxTarget`, :class:`~packaging.tags.MacOSTarget`,
+  and :class:`~packaging.tags.ExplicitTarget`), a pure-data description of a
+  target Python environment for which compatibility tags can be computed
+  without reading the running interpreter's configuration.
+  :meth:`TargetEnvironment.current()
+  <packaging.tags.TargetEnvironment.current>` describes the running
+  interpreter and matches :func:`~packaging.tags.sys_tags`.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
