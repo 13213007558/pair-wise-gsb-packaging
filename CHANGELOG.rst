@@ -4,6 +4,16 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :mod:`packaging.lockmerge` with
+  :func:`~packaging.lockmerge.merge_requirements`, merging requirement
+  lines against an explicit matrix of target environments: markers are
+  evaluated per environment, extras and version specifiers are merged per
+  normalized project name, constraints only restrict activated packages,
+  and conflicts (direct URL vs. specifier, differing URLs, unsatisfiable
+  specifier intersections) are reported against the original input lines.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)

@@ -29,6 +29,7 @@ The ``packaging`` library uses calendar-based versioning (``YY.N``).
     markers
     licenses
     requirements
+    lockmerge
     metadata
     tags
     pylock
