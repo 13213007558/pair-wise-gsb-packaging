@@ -232,6 +232,47 @@ _LEGACY_MANYLINUX_MAP: dict[_GLibCVersion, str] = {
 }
 
 
+def _glibc_version_candidates(
+    archs: Sequence[str], current_glibc: _GLibCVersion
+) -> Iterator[_GLibCVersion]:
+    """Yield every glibc version to emit tags for, from newest to oldest.
+
+    This is pure data manipulation based on the provided glibc version;
+    deciding whether each candidate is actually compatible is left to the
+    caller.
+    """
+    # Oldest glibc to be supported regardless of architecture is (2, 17).
+    too_old_glibc2 = _GLibCVersion(2, 16)
+    if set(archs) & {"x86_64", "i686"}:
+        # On x86/i686 also oldest glibc to be supported is (2, 5).
+        too_old_glibc2 = _GLibCVersion(2, 4)
+    glibc_max_list = [current_glibc]
+    # We can assume compatibility across glibc major versions.
+    # https://sourceware.org/bugzilla/show_bug.cgi?id=24636
+    #
+    # Build a list of maximum glibc versions so that we can
+    # output the canonical list of all glibc from current_glibc
+    # down to too_old_glibc2, including all intermediary versions.
+    for glibc_major in range(current_glibc.major - 1, 1, -1):
+        glibc_minor = _LAST_GLIBC_MINOR[glibc_major]
+        glibc_max_list.append(_GLibCVersion(glibc_major, glibc_minor))
+    for glibc_max in glibc_max_list:
+        if glibc_max.major == too_old_glibc2.major:
+            min_minor = too_old_glibc2.minor
+        else:
+            # For other glibc major versions oldest supported is (x, 0).
+            min_minor = -1
+        for glibc_minor in range(glibc_max.minor, min_minor, -1):
+            yield _GLibCVersion(glibc_max.major, glibc_minor)
+
+
+def _manylinux_tags(arch: str, glibc_version: _GLibCVersion) -> Iterator[str]:
+    yield "manylinux_{}_{}_{}".format(*glibc_version, arch)
+    # Handle the legacy manylinux1, manylinux2010, manylinux2014 tags.
+    if legacy_tag := _LEGACY_MANYLINUX_MAP.get(glibc_version):
+        yield f"{legacy_tag}_{arch}"
+
+
 def platform_tags(archs: Sequence[str]) -> Iterator[str]:
     """Generate manylinux tags compatible to the current platform.
 
@@ -245,34 +286,31 @@ def platform_tags(archs: Sequence[str]) -> Iterator[str]:
     """
     if not _have_compatible_abi(sys.executable, archs):
         return
-    # Oldest glibc to be supported regardless of architecture is (2, 17).
-    too_old_glibc2 = _GLibCVersion(2, 16)
-    if set(archs) & {"x86_64", "i686"}:
-        # On x86/i686 also oldest glibc to be supported is (2, 5).
-        too_old_glibc2 = _GLibCVersion(2, 4)
     current_glibc = _GLibCVersion(*_get_glibc_version())
-    glibc_max_list = [current_glibc]
-    # We can assume compatibility across glibc major versions.
-    # https://sourceware.org/bugzilla/show_bug.cgi?id=24636
-    #
-    # Build a list of maximum glibc versions so that we can
-    # output the canonical list of all glibc from current_glibc
-    # down to too_old_glibc2, including all intermediary versions.
-    for glibc_major in range(current_glibc.major - 1, 1, -1):
-        glibc_minor = _LAST_GLIBC_MINOR[glibc_major]
-        glibc_max_list.append(_GLibCVersion(glibc_major, glibc_minor))
     for arch in archs:
-        for glibc_max in glibc_max_list:
-            if glibc_max.major == too_old_glibc2.major:
-                min_minor = too_old_glibc2.minor
-            else:
-                # For other glibc major versions oldest supported is (x, 0).
-                min_minor = -1
-            for glibc_minor in range(glibc_max.minor, min_minor, -1):
-                glibc_version = _GLibCVersion(glibc_max.major, glibc_minor)
-                if _is_compatible(arch, glibc_version):
-                    yield "manylinux_{}_{}_{}".format(*glibc_version, arch)
+        for glibc_version in _glibc_version_candidates(archs, current_glibc):
+            if _is_compatible(arch, glibc_version):
+                yield from _manylinux_tags(arch, glibc_version)
 
-                    # Handle the legacy manylinux1, manylinux2010, manylinux2014 tags.
-                    if legacy_tag := _LEGACY_MANYLINUX_MAP.get(glibc_version):
-                        yield f"{legacy_tag}_{arch}"
+
+def glibc_platform_tags(
+    archs: Sequence[str], glibc_version: tuple[int, int]
+) -> Iterator[str]:
+    """Generate manylinux tags for a target with the given glibc version.
+
+    Unlike :func:`platform_tags`, this never inspects the running system:
+    compatibility is decided purely from the explicitly provided
+    ``glibc_version``.
+
+    :param archs: Sequence of compatible architectures.
+        The first one shall be the closest to the actual architecture and be the part of
+        platform tag after the ``linux_`` prefix, e.g. ``x86_64``.
+    :param glibc_version: The glibc version of the target, e.g. ``(2, 17)``.
+
+    :returns: An iterator of compatible manylinux tags.
+    """
+    current_glibc = _GLibCVersion(*glibc_version)
+    for arch in archs:
+        for candidate in _glibc_version_candidates(archs, current_glibc):
+            if candidate <= current_glibc:
+                yield from _manylinux_tags(arch, candidate)

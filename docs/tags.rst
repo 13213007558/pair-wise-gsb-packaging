@@ -46,6 +46,9 @@ items that applications should need to reference, in order to parse and check ta
 
 .. autofunction:: sys_tags
 
+.. autoclass:: TargetEnvironment
+   :members:
+
 .. autofunction:: create_compatible_tags_selector
 
 .. autoexception:: TooManyTagsError

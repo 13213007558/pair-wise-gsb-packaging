@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import operator
 import platform
@@ -16,6 +17,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from importlib.machinery import EXTENSION_SUFFIXES
 from typing import (
     TYPE_CHECKING,
+    Any,
     TypeVar,
     cast,
 )
@@ -33,6 +35,7 @@ __all__ = [
     "InvalidTag",
     "PythonVersion",
     "Tag",
+    "TargetEnvironment",
     "TooManyTagsError",
     "UnsortedTagsError",
     "android_platforms",
@@ -363,35 +366,74 @@ def _abi3t_applies(python_version: PythonVersion, threading: bool) -> bool:
     return len(python_version) > 1 and tuple(python_version) >= (3, 2) and threading
 
 
-def _cpython_abis(py_version: PythonVersion, warn: bool = False) -> Iterator[str]:
+def _cpython_abis_from_build(
+    py_version: PythonVersion,
+    *,
+    free_threaded: bool = False,
+    debug: bool = False,
+    pymalloc: bool = True,
+    ucs4: bool = False,
+) -> Iterator[str]:
+    """Yield the CPython ABI tags for a build with the given properties.
+
+    This is a pure function of its arguments: nothing is read from the
+    running interpreter, so it can describe arbitrary target environments.
+    """
     py_version = tuple(py_version)  # To allow for version comparison.
     version = _version_nodot(py_version[:2])
-    threading = debug = pymalloc = ucs4 = ""
+    threading = "t" if free_threaded and py_version >= (3, 13) else ""
+    debug_flag = "d" if debug else ""
+    pymalloc_flag = "m" if pymalloc and py_version < (3, 8) else ""
+    ucs4_flag = "u" if ucs4 and py_version < (3, 3) else ""
+    yield f"cp{version}{threading}{debug_flag}{pymalloc_flag}{ucs4_flag}"
+    if py_version >= (3, 8) and debug:
+        # Debug builds can also load "normal" extension modules.
+        # We can also assume no UCS-4 or pymalloc requirement.
+        yield f"cp{version}{threading}"
+
+
+def _host_cpython_build(
+    py_version: PythonVersion, warn: bool = False
+) -> tuple[bool, bool, bool, bool]:
+    """Detect the build properties of the running CPython interpreter.
+
+    Returns a ``(free_threaded, debug, pymalloc, ucs4)`` tuple suitable for
+    :func:`_cpython_abis_from_build`.
+    """
+    py_version = tuple(py_version)  # To allow for version comparison.
     with_debug = _get_config_var("Py_DEBUG", warn)
     has_refcount = hasattr(sys, "gettotalrefcount")
     # Windows doesn't set Py_DEBUG, so checking for support of debug-compiled
     # extension modules is the best option.
     # https://github.com/pypa/pip/issues/3383#issuecomment-173267692
     has_ext = "_d.pyd" in EXTENSION_SUFFIXES
-    if with_debug or (with_debug is None and (has_refcount or has_ext)):
-        debug = "d"
-    if py_version >= (3, 13) and _get_config_var("Py_GIL_DISABLED", warn):
-        threading = "t"
+    debug = bool(with_debug or (with_debug is None and (has_refcount or has_ext)))
+    free_threaded = py_version >= (3, 13) and bool(
+        _get_config_var("Py_GIL_DISABLED", warn)
+    )
+    pymalloc = True
+    ucs4 = False
     if py_version < (3, 8):
         with_pymalloc = _get_config_var("WITH_PYMALLOC", warn)
-        if with_pymalloc or with_pymalloc is None:
-            pymalloc = "m"
+        pymalloc = bool(with_pymalloc or with_pymalloc is None)
         if py_version < (3, 3):
             unicode_size = _get_config_var("Py_UNICODE_SIZE", warn)
-            if unicode_size == 4 or (
-                unicode_size is None and sys.maxunicode == 0x10FFFF
-            ):
-                ucs4 = "u"
-    yield f"cp{version}{threading}{debug}{pymalloc}{ucs4}"
-    if py_version >= (3, 8) and debug:
-        # Debug builds can also load "normal" extension modules.
-        # We can also assume no UCS-4 or pymalloc requirement.
-        yield f"cp{version}{threading}"
+            ucs4 = bool(
+                unicode_size == 4
+                or (unicode_size is None and sys.maxunicode == 0x10FFFF)
+            )
+    return free_threaded, debug, pymalloc, ucs4
+
+
+def _cpython_abis(py_version: PythonVersion, warn: bool = False) -> Iterator[str]:
+    free_threaded, debug, pymalloc, ucs4 = _host_cpython_build(py_version, warn)
+    yield from _cpython_abis_from_build(
+        py_version,
+        free_threaded=free_threaded,
+        debug=debug,
+        pymalloc=pymalloc,
+        ucs4=ucs4,
+    )
 
 
 def cpython_tags(
@@ -680,6 +722,29 @@ def _mac_binary_formats(version: AppleVersion, cpu_arch: str) -> list[str]:
     return formats
 
 
+def _current_mac_version() -> AppleVersion:
+    """Return the macOS version of the running system."""
+    version_str, _, _ = platform.mac_ver()
+    version = cast("AppleVersion", tuple(map(int, version_str.split(".")[:2])))
+    if version == (10, 16):
+        # When built against an older macOS SDK, Python will report macOS 10.16
+        # instead of the real version.
+        version_str = subprocess.run(
+            [
+                sys.executable,
+                "-sS",
+                "-c",
+                "import platform; print(platform.mac_ver()[0])",
+            ],
+            check=True,
+            env={"SYSTEM_VERSION_COMPAT": "0"},
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout
+        version = cast("AppleVersion", tuple(map(int, version_str.split(".")[:2])))
+    return version
+
+
 def mac_platforms(
     version: AppleVersion | None = None, arch: str | None = None
 ) -> Iterator[str]:
@@ -706,30 +771,11 @@ def mac_platforms(
 
     .. versionadded:: 20.0
     """
-    if version is None or arch is None:
-        version_str, _, cpu_arch = platform.mac_ver()
-        if version is None:
-            version = cast("AppleVersion", tuple(map(int, version_str.split(".")[:2])))
-            if version == (10, 16):
-                # When built against an older macOS SDK, Python will report macOS 10.16
-                # instead of the real version.
-                version_str = subprocess.run(
-                    [
-                        sys.executable,
-                        "-sS",
-                        "-c",
-                        "import platform; print(platform.mac_ver()[0])",
-                    ],
-                    check=True,
-                    env={"SYSTEM_VERSION_COMPAT": "0"},
-                    stdout=subprocess.PIPE,
-                    text=True,
-                ).stdout
-                version = cast(
-                    "AppleVersion", tuple(map(int, version_str.split(".")[:2]))
-                )
-        if arch is None:
-            arch = _mac_arch(cpu_arch)
+    if version is None:
+        version = _current_mac_version()
+    if arch is None:
+        _, _, cpu_arch = platform.mac_ver()
+        arch = _mac_arch(cpu_arch)
 
     if (10, 0) <= version < (11, 0):
         # Prior to Mac OS 11, each yearly release of Mac OS bumped the
@@ -875,6 +921,11 @@ def android_platforms(
         yield f"android_{ver}_{abi}"
 
 
+def _linux_archs(arch: str) -> list[str]:
+    """Return the compatible Linux architectures, most specific first."""
+    return {"armv8l": ["armv8l", "armv7l"]}.get(arch, [arch])
+
+
 def _linux_platforms(is_32bit: bool = _32_BIT_INTERPRETER) -> Iterator[str]:
     linux = _normalize_string(sysconfig.get_platform())
     if not linux.startswith("linux_"):
@@ -887,7 +938,7 @@ def _linux_platforms(is_32bit: bool = _32_BIT_INTERPRETER) -> Iterator[str]:
         elif linux == "linux_aarch64":
             linux = "linux_armv8l"
     _, arch = linux.split("_", 1)
-    archs = {"armv8l": ["armv8l", "armv7l"]}.get(arch, [arch])
+    archs = _linux_archs(arch)
     for arch in archs:
         yield f"linux_{arch}"
     yield from _manylinux.platform_tags(archs)
@@ -971,6 +1022,286 @@ def interpreter_abi() -> str:
     if interpreter_name() == "cp":
         return next(iter(_cpython_abis(sys.version_info[:2])))
     return next(iter(_generic_abi()))
+
+
+_WINDOWS_ARCH_TAGS: dict[str, str] = {
+    "x86": "win32",
+    "i386": "win32",
+    "i686": "win32",
+    "x86_64": "win_amd64",
+    "amd64": "win_amd64",
+    "arm64": "win_arm64",
+    "aarch64": "win_arm64",
+}
+
+_TARGET_PLATFORM_ALIASES: dict[str, str] = {
+    "darwin": "macos",
+    "mac": "macos",
+    "osx": "macos",
+    "win": "windows",
+    "win32": "windows",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class TargetEnvironment:
+    """
+    A pure-data description of a Python environment to compute tags for.
+
+    This is useful when picking wheels for a machine other than the one
+    running this code (e.g. a package index selecting wheels for a client):
+    every relevant property of the target is stated explicitly and nothing
+    is ever read from the running interpreter or the host operating system.
+
+    All fields are validated on construction. Missing information (e.g. a
+    Linux target without libc versions) and contradictory information (e.g.
+    both ``glibc_version`` and ``musl_version`` set) raise
+    :exc:`ValueError` describing every problem found, rather than silently
+    falling back to values from the host.
+
+    Instances are immutable, and :meth:`tags` always produces the same
+    sequence for the same data, regardless of the host or of other targets
+    constructed in the same process.
+
+    .. versionadded:: 26.4
+    """
+
+    interpreter: str
+    """The interpreter name, e.g. ``"cpython"`` or ``"pypy"``.
+
+    Well-known names are normalized to their short form (see
+    :data:`INTERPRETER_SHORT_NAMES`).
+    """
+
+    python_version: tuple[int, ...]
+    """The Python version of the target, e.g. ``(3, 13)``."""
+
+    platform: str
+    """The target platform: ``"linux"``, ``"macos"``, ``"windows"``,
+    or any other system name (for which a generic
+    ``"<platform>_<architecture>"`` platform tag is produced)."""
+
+    architecture: str
+    """The CPU architecture of the target, e.g. ``"x86_64"`` or
+    ``"arm64"``. For macOS targets, ``"universal2"`` is also accepted."""
+
+    abi: str | None = None
+    """The ABI tag of the target, e.g. ``"cp313"``.
+
+    Required for non-CPython interpreters. For CPython it is derived from
+    ``python_version`` and the ``free_threaded``/``debug`` build
+    flags unless given explicitly.
+    """
+
+    free_threaded: bool = False
+    """Whether the target is a CPython free-threaded (``--disable-gil``)
+    build. Requires Python 3.13 or later."""
+
+    debug: bool = False
+    """Whether the target is a CPython debug build."""
+
+    glibc_version: tuple[int, int] | None = None
+    """The glibc version of a Linux target, e.g. ``(2, 17)``. Enables
+    ``manylinux`` tags. Mutually exclusive with ``musl_version``."""
+
+    musl_version: tuple[int, int] | None = None
+    """The musl libc version of a Linux target, e.g. ``(1, 2)``. Enables
+    ``musllinux`` tags. Mutually exclusive with ``glibc_version``."""
+
+    macos_version: AppleVersion | None = None
+    """The macOS deployment target of a macOS target, e.g. ``(11, 0)``."""
+
+    def __post_init__(self) -> None:
+        interpreter = self.interpreter.lower()
+        interpreter = INTERPRETER_SHORT_NAMES.get(interpreter, interpreter)
+        object.__setattr__(self, "interpreter", interpreter)
+        object.__setattr__(self, "python_version", tuple(self.python_version))
+        platform_name = _TARGET_PLATFORM_ALIASES.get(
+            self.platform.lower(), self.platform.lower()
+        )
+        object.__setattr__(self, "platform", platform_name)
+
+        problems: list[str] = []
+
+        if (
+            not self.python_version
+            or len(self.python_version) > 2
+            or not all(isinstance(v, int) for v in self.python_version)
+        ):
+            problems.append(
+                "python_version must be a (major,) or (major, minor) pair of integers"
+            )
+        for name in ("glibc_version", "musl_version", "macos_version"):
+            value = getattr(self, name)
+            if value is not None and (
+                len(value) != 2 or not all(isinstance(v, int) for v in value)
+            ):
+                problems.append(f"{name} must be a (major, minor) pair of integers")
+
+        # Contradictory combinations.
+        if self.glibc_version is not None and self.musl_version is not None:
+            problems.append("glibc_version and musl_version are mutually exclusive")
+        if platform_name != "linux" and (
+            self.glibc_version is not None or self.musl_version is not None
+        ):
+            problems.append(
+                "glibc_version/musl_version are only meaningful for platform"
+                f" 'linux', not {platform_name!r}"
+            )
+        if platform_name != "macos" and self.macos_version is not None:
+            problems.append(
+                f"macos_version is only meaningful for platform 'macos',"
+                f" not {platform_name!r}"
+            )
+        if self.abi is not None and (self.free_threaded or self.debug):
+            problems.append(
+                "abi cannot be combined with the free_threaded/debug build flags"
+            )
+        if self.free_threaded and tuple(self.python_version[:2]) < (3, 13):
+            problems.append("free_threaded requires python_version >= (3, 13)")
+        if platform_name == "windows" and self.architecture not in _WINDOWS_ARCH_TAGS:
+            problems.append(f"unsupported Windows architecture: {self.architecture!r}")
+
+        # Missing information.
+        if (
+            platform_name == "linux"
+            and self.glibc_version is None
+            and self.musl_version is None
+        ):
+            problems.append("platform 'linux' requires glibc_version or musl_version")
+        if platform_name == "macos" and self.macos_version is None:
+            problems.append(
+                "platform 'macos' requires macos_version (the deployment target)"
+            )
+        if interpreter == "cp":
+            if self.abi is None and len(self.python_version) < 2:
+                problems.append(
+                    "python_version must include a minor version to derive the"
+                    " CPython ABI (or pass abi explicitly)"
+                )
+        elif self.abi is None:
+            problems.append(f"abi is required for interpreter {self.interpreter!r}")
+
+        if problems:
+            raise ValueError("invalid TargetEnvironment: " + "; ".join(problems))
+
+    @classmethod
+    def current(cls) -> TargetEnvironment:
+        """
+        Describe the running interpreter and the host platform.
+
+        This is the one place where host state (``sysconfig``,
+        ``platform``, the C library) is consulted, and it is explicit
+        rather than a silent fallback. For the returned environment,
+        :meth:`tags` yields the same sequence as :func:`sys_tags`.
+
+        :raises ValueError: If the host platform cannot be described (e.g.
+            an unknown operating system, or a Linux system whose C library
+            could not be identified).
+        """
+        system = platform.system()
+        kwargs: dict[str, Any] = {}
+        if system == "Darwin":
+            platform_name = "macos"
+            architecture = _mac_arch(platform.mac_ver()[2])
+            kwargs["macos_version"] = _current_mac_version()
+        elif system == "Linux":
+            platform_name = "linux"
+            linux = _normalize_string(sysconfig.get_platform())
+            if linux.startswith("linux_"):
+                _, architecture = linux.split("_", 1)
+            else:
+                architecture = linux
+            if _32_BIT_INTERPRETER:
+                architecture = {"x86_64": "i686", "aarch64": "armv8l"}.get(
+                    architecture, architecture
+                )
+            musl_version = _musllinux._get_musl_version(sys.executable)
+            if musl_version is not None:
+                kwargs["musl_version"] = tuple(musl_version)
+            else:
+                glibc_version = _manylinux._get_glibc_version()
+                if glibc_version.major > 0:
+                    kwargs["glibc_version"] = tuple(glibc_version)
+        elif system == "Windows":
+            platform_name = "windows"
+            architecture = {
+                "win32": "x86",
+                "win-amd64": "x86_64",
+                "win-arm64": "arm64",
+            }.get(sysconfig.get_platform(), sysconfig.get_platform())
+        else:
+            raise ValueError(
+                f"cannot describe the current platform {system!r} as a"
+                " TargetEnvironment"
+            )
+
+        interpreter = interpreter_name()
+        if interpreter == "cp":
+            free_threaded, debug, _, _ = _host_cpython_build(sys.version_info[:2])
+            kwargs["free_threaded"] = free_threaded
+            kwargs["debug"] = debug
+        else:
+            kwargs["abi"] = interpreter_abi()
+
+        return cls(
+            interpreter=interpreter,
+            python_version=tuple(sys.version_info[:2]),
+            platform=platform_name,
+            architecture=architecture,
+            **kwargs,
+        )
+
+    def _platform_tags(self) -> Iterator[str]:
+        if self.platform == "linux":
+            archs = _linux_archs(self.architecture)
+            for arch in archs:
+                yield f"linux_{arch}"
+            if self.glibc_version is not None:
+                yield from _manylinux.glibc_platform_tags(archs, self.glibc_version)
+            if self.musl_version is not None:
+                yield from _musllinux.musl_platform_tags(archs, self.musl_version)
+        elif self.platform == "macos":
+            yield from mac_platforms(self.macos_version, self.architecture)
+        elif self.platform == "windows":
+            yield _WINDOWS_ARCH_TAGS[self.architecture]
+        else:
+            yield _normalize_string(f"{self.platform}_{self.architecture}")
+
+    def tags(self) -> Iterator[Tag]:
+        """
+        Yields the sequence of tag triples that the target supports.
+
+        The iterable is ordered so that the best-matching tag is first in
+        the sequence, exactly like :func:`sys_tags`. The sequence is a pure
+        function of the environment data: it does not depend on the running
+        interpreter or the host platform in any way.
+        """
+        platforms = list(self._platform_tags())
+        python_version = self.python_version
+        if self.interpreter == "cp":
+            if self.abi is not None:
+                abis = [self.abi]
+            else:
+                abis = list(
+                    _cpython_abis_from_build(
+                        python_version,
+                        free_threaded=self.free_threaded,
+                        debug=self.debug,
+                    )
+                )
+            yield from cpython_tags(python_version, abis=abis, platforms=platforms)
+            compatible_interpreter: str | None = (
+                f"cp{_version_nodot(python_version[:2])}"
+            )
+        else:
+            abi = cast("str", self.abi)  # required by validation
+            interpreter = f"{self.interpreter}{_version_nodot(python_version[:2])}"
+            yield from generic_tags(interpreter, abis=[abi], platforms=platforms)
+            compatible_interpreter = "pp3" if self.interpreter == "pp" else None
+        yield from compatible_tags(
+            python_version, interpreter=compatible_interpreter, platforms=platforms
+        )
 
 
 def sys_tags(*, warn: bool = False) -> Iterator[Tag]:

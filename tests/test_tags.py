@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import collections.abc
+import dataclasses
 import subprocess
 
 try:
@@ -2202,3 +2203,349 @@ def test_interpreter_abi(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (
         tags.interpreter_abi() == f"cp{sys.version_info.major}{sys.version_info.minor}"
     )
+
+
+class TestTargetEnvironment:
+    def test_linux_glibc_tags(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+        )
+        result = [str(t) for t in env.tags()]
+        expected_platforms = (
+            ["linux_x86_64", "manylinux_2_17_x86_64", "manylinux2014_x86_64"]
+            + [f"manylinux_2_{minor}_x86_64" for minor in range(16, 12, -1)]
+            + ["manylinux_2_12_x86_64", "manylinux2010_x86_64"]
+            + [f"manylinux_2_{minor}_x86_64" for minor in range(11, 5, -1)]
+            + ["manylinux_2_5_x86_64", "manylinux1_x86_64"]
+        )
+        # Native linux_* tags come before manylinux ones, best match first.
+        assert result[: len(expected_platforms)] == [
+            f"cp312-cp312-{platform}" for platform in expected_platforms
+        ]
+        # abi3 tags are generated down to Python 3.2, the abi3 lower bound.
+        abi3_tags = [t for t in result if "-abi3-" in t]
+        assert abi3_tags[0].startswith("cp312-abi3-linux_x86_64")
+        assert abi3_tags[-1].startswith("cp32-abi3-")
+        # The most generic pure-Python tags come last.
+        assert result[-1] == "py30-none-any"
+        assert "py3-none-any" in result
+
+    def test_linux_musl_tags(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 13),
+            platform="linux",
+            architecture="aarch64",
+            musl_version=(1, 2),
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp313-cp313-linux_aarch64"
+        assert "cp313-cp313-musllinux_1_2_aarch64" in result
+        assert "cp313-cp313-musllinux_1_1_aarch64" in result
+        assert "cp313-cp313-musllinux_1_0_aarch64" in result
+        assert not any("manylinux" in t for t in result)
+
+    def test_linux_armv8l_expands_to_armv7l(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="linux",
+            architecture="armv8l",
+            musl_version=(1, 1),
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312-linux_armv8l"
+        assert result[1] == "cp312-cp312-linux_armv7l"
+        assert "cp312-cp312-musllinux_1_1_armv7l" in result
+
+    def test_free_threaded_cpython(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 13),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+            free_threaded=True,
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp313-cp313t-linux_x86_64"
+        assert "cp313-abi3t-linux_x86_64" in result
+        # The abi3t lower bound mirrors the abi3 one.
+        assert "cp32-abi3t-linux_x86_64" in result
+        # Free-threaded builds do not support abi3.
+        assert not any("-abi3-" in t for t in result)
+
+    def test_macos_arm64(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="macos",
+            architecture="arm64",
+            macos_version=(11, 0),
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312-macosx_11_0_arm64"
+        assert "cp312-cp312-macosx_11_0_universal2" in result
+        # universal2 binaries can target macOS 10.x via their x86_64 slice.
+        assert "cp312-cp312-macosx_10_16_universal2" in result
+        # No other binary format exists for macOS 10.x on arm64.
+        assert not any("macosx_10" in t and "universal2" not in t for t in result)
+
+    def test_macos_x86_64(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="macos",
+            architecture="x86_64",
+            macos_version=(10, 13),
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312-macosx_10_13_x86_64"
+        # The deployment target bounds the range of generated versions.
+        assert "cp312-cp312-macosx_10_9_x86_64" in result
+        assert not any("macosx_10_14" in t for t in result)
+        assert "cp312-cp312-macosx_10_13_universal2" in result
+
+    def test_windows(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="windows",
+            architecture="x86_64",
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312-win_amd64"
+        assert "py3-none-any" in result
+
+    def test_generic_platform(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="freebsd",
+            architecture="x86_64",
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312-freebsd_x86_64"
+
+    def test_pypy(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="pypy",
+            python_version=(3, 10),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+            abi="pypy310_pp73",
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "pp310-pypy310_pp73-linux_x86_64"
+        assert "pp310-none-linux_x86_64" in result
+        assert "pp3-none-any" in result
+
+    def test_cpython_explicit_abi(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+            abi="cp312d",
+        )
+        result = [str(t) for t in env.tags()]
+        assert result[0] == "cp312-cp312d-linux_x86_64"
+
+    def test_normalization(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="CPython",
+            python_version=(3, 12),
+            platform="Darwin",
+            architecture="arm64",
+            macos_version=(11, 0),
+        )
+        assert env.interpreter == "cp"
+        assert env.python_version == (3, 12)
+        assert env.platform == "macos"
+
+    def test_immutable(self) -> None:
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            env.platform = "windows"  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            pytest.param(
+                {"platform": "linux"},
+                "requires glibc_version or musl_version",
+                id="linux-missing-libc",
+            ),
+            pytest.param(
+                {"platform": "linux", "glibc_version": (2, 17), "musl_version": (1, 2)},
+                "mutually exclusive",
+                id="linux-both-libcs",
+            ),
+            pytest.param(
+                {"platform": "macos"},
+                "requires macos_version",
+                id="macos-missing-version",
+            ),
+            pytest.param(
+                {
+                    "platform": "linux",
+                    "glibc_version": (2, 17),
+                    "macos_version": (11, 0),
+                },
+                "only meaningful for platform 'macos'",
+                id="macos-version-on-linux",
+            ),
+            pytest.param(
+                {"platform": "windows", "glibc_version": (2, 17)},
+                "only meaningful for platform 'linux'",
+                id="glibc-on-windows",
+            ),
+            pytest.param(
+                {
+                    "platform": "linux",
+                    "glibc_version": (2, 17),
+                    "python_version": (3, 12),
+                    "free_threaded": True,
+                },
+                "free_threaded requires python_version",
+                id="free-threaded-too-old",
+            ),
+            pytest.param(
+                {
+                    "platform": "linux",
+                    "glibc_version": (2, 17),
+                    "abi": "cp312",
+                    "debug": True,
+                },
+                "cannot be combined",
+                id="abi-with-build-flags",
+            ),
+            pytest.param(
+                {"platform": "linux", "glibc_version": (2, 17), "interpreter": "pypy"},
+                "abi is required",
+                id="pypy-missing-abi",
+            ),
+            pytest.param(
+                {
+                    "platform": "linux",
+                    "glibc_version": (2, 17),
+                    "python_version": (3,),
+                },
+                "minor version",
+                id="cpython-major-only",
+            ),
+            pytest.param(
+                {"platform": "windows", "architecture": "ppc"},
+                "unsupported Windows architecture",
+                id="windows-bad-arch",
+            ),
+            pytest.param(
+                {
+                    "platform": "linux",
+                    "glibc_version": (2, 17),
+                    "python_version": (),
+                },
+                "python_version must be",
+                id="empty-version",
+            ),
+        ],
+    )
+    def test_invalid(self, kwargs: dict, match: str) -> None:
+        base: dict = {
+            "interpreter": "cpython",
+            "python_version": (3, 12),
+            "platform": "linux",
+            "architecture": "x86_64",
+        }
+        base.update(kwargs)
+        with pytest.raises(ValueError, match=match):
+            tags.TargetEnvironment(**base)
+
+    def test_reports_all_problems(self) -> None:
+        with pytest.raises(ValueError, match="invalid TargetEnvironment") as exc_info:
+            tags.TargetEnvironment(
+                interpreter="cpython",
+                python_version=(3, 12),
+                platform="linux",
+                architecture="x86_64",
+                glibc_version=(2, 17),
+                musl_version=(1, 2),
+                macos_version=(11, 0),
+            )
+        message = str(exc_info.value)
+        assert "mutually exclusive" in message
+        assert "only meaningful for platform 'macos'" in message
+
+    def test_no_host_state_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Generating tags for a target must never consult the host.
+        monkeypatch.setattr(
+            sysconfig, "get_platform", pretend.raiser(AssertionError("host used"))
+        )
+        monkeypatch.setattr(
+            sysconfig, "get_config_var", pretend.raiser(AssertionError("host used"))
+        )
+        monkeypatch.setattr(
+            platform, "system", pretend.raiser(AssertionError("host used"))
+        )
+        monkeypatch.setattr(
+            platform, "mac_ver", pretend.raiser(AssertionError("host used"))
+        )
+        env = tags.TargetEnvironment(
+            interpreter="cpython",
+            python_version=(3, 12),
+            platform="linux",
+            architecture="x86_64",
+            glibc_version=(2, 17),
+        )
+        assert str(next(env.tags())) == "cp312-cp312-linux_x86_64"
+
+    def test_deterministic_across_constructions(self) -> None:
+        def make() -> list[tags.TargetEnvironment]:
+            return [
+                tags.TargetEnvironment(
+                    interpreter="cpython",
+                    python_version=(3, 13),
+                    platform="linux",
+                    architecture="x86_64",
+                    glibc_version=(2, 17),
+                ),
+                tags.TargetEnvironment(
+                    interpreter="cpython",
+                    python_version=(3, 13),
+                    platform="macos",
+                    architecture="arm64",
+                    macos_version=(14, 0),
+                    free_threaded=True,
+                ),
+                tags.TargetEnvironment(
+                    interpreter="pypy",
+                    python_version=(3, 10),
+                    platform="linux",
+                    architecture="aarch64",
+                    musl_version=(1, 2),
+                    abi="pypy310_pp73",
+                ),
+            ]
+
+        first = [[str(t) for t in env.tags()] for env in make()]
+        second = [[str(t) for t in env.tags()] for env in make()]
+        assert first == second
+        # Repeated generation from the same instance is stable too.
+        env = make()[0]
+        assert [str(t) for t in env.tags()] == [str(t) for t in env.tags()]
+
+    def test_current_matches_sys_tags(self) -> None:
+        env = tags.TargetEnvironment.current()
+        assert [str(t) for t in env.tags()] == [str(t) for t in tags.sys_tags()]

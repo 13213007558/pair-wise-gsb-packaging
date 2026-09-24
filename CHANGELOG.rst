@@ -4,6 +4,15 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :class:`~packaging.tags.TargetEnvironment`, a pure-data description of
+  a target Python environment (interpreter, version, ABI, architecture, and
+  platform capabilities such as the glibc/musl version or the macOS
+  deployment target) that yields the ordered compatible tags for that target
+  without consulting the running interpreter or host system. Missing or
+  contradictory target data is rejected with an explicit error.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
