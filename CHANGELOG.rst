@@ -4,6 +4,15 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`packaging.licenses.select_license_expression`, together with
+  :class:`~packaging.licenses.LicensePolicy` and
+  :class:`~packaging.licenses.LicenseSelection`, for evaluating a
+  License-Expression against a caller-provided allow-list policy and
+  selecting an acceptable branch (or reporting the minimal blocking
+  sub-expression).
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
