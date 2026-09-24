@@ -4,6 +4,16 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add a :mod:`packaging.merge` module with
+  :func:`~packaging.merge.merge_requirements`, which evaluates requirements
+  against an explicit matrix of target environments and merges them into
+  one normalized constraint per project and environment: extras are
+  unioned, version specifiers intersected, constraints applied only to
+  activated projects, and direct-URL or unsatisfiable-specifier conflicts
+  reported back to the originating inputs.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
