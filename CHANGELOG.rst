@@ -4,6 +4,13 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`packaging.metadata.compare_metadata` to compare an sdist's
+  ``PKG-INFO`` against a wheel's ``METADATA``, reporting which fields
+  changed, whether the sdist's ``Dynamic`` declarations allowed the change, and
+  whether the metadata version provides enough information to judge at all.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import collections
+import dataclasses
 import email.header
 import email.message
 import email.parser
 import email.policy
+import enum
 import keyword
 import pathlib
 import re
@@ -30,12 +33,17 @@ T = typing.TypeVar("T")
 
 
 __all__ = [
+    "ChangeKind",
+    "ComparisonStatus",
     "ExceptionGroup",  # Keep this for a bit (makes mypy happy w/ 26.0 compat)
+    "FieldChange",
     "InvalidMetadata",
     "Metadata",
+    "MetadataComparison",
     "RFC822Message",
     "RFC822Policy",
     "RawMetadata",
+    "compare_metadata",
     "parse_email",
 ]
 
@@ -1053,3 +1061,319 @@ class Metadata:
         # The description is a special case because it is in the body of the message.
         if self.description is not None:
             message.set_payload(self.description)
+
+
+class ComparisonStatus(enum.Enum):
+    """The overall verdict of comparing sdist and wheel metadata.
+
+    .. versionadded:: 26.4
+    """
+
+    COMPATIBLE = "compatible"
+    """Every field not declared ``Dynamic`` is identical on both sides."""
+
+    VIOLATED = "violated"
+    """At least one static field differs, or ``Dynamic`` was used illegally."""
+
+    UNKNOWN = "unknown"
+    """The metadata version provides no ``Dynamic`` information (it predates
+    metadata 2.2 / PEP 643 or is missing/invalid), so whether the differences
+    are legitimate cannot be determined."""
+
+
+class ChangeKind(enum.Enum):
+    """How a single field differs between sdist and wheel metadata.
+
+    .. versionadded:: 26.4
+    """
+
+    ADDED = "added"
+    """The field is present in the wheel metadata but not in the sdist."""
+
+    REMOVED = "removed"
+    """The field is present in the sdist metadata but not in the wheel."""
+
+    CHANGED = "changed"
+    """The field is present on both sides with different values."""
+
+
+@dataclasses.dataclass(frozen=True)
+class FieldChange:
+    """A single observed difference between sdist and wheel metadata.
+
+    .. versionadded:: 26.4
+    """
+
+    field: str
+    """The core metadata field name (email-style, e.g. ``Requires-Dist``)."""
+
+    kind: ChangeKind
+    sdist_value: Any
+    """The value found in the sdist metadata (``None`` when absent)."""
+
+    wheel_value: Any
+    """The value found in the wheel metadata (``None`` when absent)."""
+
+    allowed: bool
+    """Whether the difference is permitted by the sdist's ``Dynamic`` declaration."""
+
+    reason: str
+    """The basis for the decision, for inclusion in reports."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MetadataComparison:
+    """The result of comparing sdist ``PKG-INFO`` against wheel ``METADATA``.
+
+    .. versionadded:: 26.4
+    """
+
+    status: ComparisonStatus
+    """The overall verdict."""
+
+    metadata_version: str | None
+    """The sdist's metadata version the verdict is based on."""
+
+    dynamic: tuple[str, ...]
+    """The fields the sdist declared as ``Dynamic`` (normalized, lower-cased)."""
+
+    invalid_dynamic: tuple[str, ...]
+    """``Dynamic`` entries that are illegal (unknown fields, or fields such as
+    ``Name``/``Version``/``Metadata-Version`` that may never be dynamic)."""
+
+    changes: tuple[FieldChange, ...]
+    """Every observed field difference, allowed or not."""
+
+    reason: str
+    """The basis for the overall verdict."""
+
+    @property
+    def violations(self) -> tuple[FieldChange, ...]:
+        """The changes that breach the sdist's static field commitments."""
+        return tuple(change for change in self.changes if not change.allowed)
+
+
+# Fields that PEP 643 forbids from ever being declared dynamic.
+_NEVER_DYNAMIC_FIELDS = frozenset({"name", "version", "metadata-version", "dynamic"})
+
+
+def _requirement_key(value: str) -> object:
+    """Return a hashable, canonicalized key for a ``Requires-Dist`` value."""
+    try:
+        return requirements.Requirement(value)
+    except requirements.InvalidRequirement:
+        # Unparsable requirements compare by their exact spelling.
+        return value
+
+
+def _extra_key(value: str) -> str:
+    try:
+        return utils.canonicalize_name(value, validate=True)
+    except utils.InvalidName:
+        return value
+
+
+def _names_equal(sdist_value: str, wheel_value: str) -> bool:
+    return utils.canonicalize_name(sdist_value) == utils.canonicalize_name(wheel_value)
+
+
+def _versions_equal(sdist_value: str, wheel_value: str) -> bool:
+    try:
+        return version_module.parse(sdist_value) == version_module.parse(wheel_value)
+    except version_module.InvalidVersion:
+        return sdist_value == wheel_value
+
+
+def _requires_dist_equal(sdist_value: list[str], wheel_value: list[str]) -> bool:
+    # Dependencies are an unordered collection; compare as multisets of
+    # parsed requirements so reordering or respelling is not a difference.
+    return collections.Counter(
+        map(_requirement_key, sdist_value)
+    ) == collections.Counter(map(_requirement_key, wheel_value))
+
+
+def _provides_extra_equal(sdist_value: list[str], wheel_value: list[str]) -> bool:
+    # Extras are an unordered set of normalized names.
+    return collections.Counter(map(_extra_key, sdist_value)) == collections.Counter(
+        map(_extra_key, wheel_value)
+    )
+
+
+# Per-field semantic comparators, keyed by RawMetadata field name. Any field
+# not listed here compares its parsed value(s) for equality directly.
+_FIELD_COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
+    "name": _names_equal,
+    "version": _versions_equal,
+    "requires_dist": _requires_dist_equal,
+    "provides_extra": _provides_extra_equal,
+}
+
+
+_HEADER_FOLD_RE = re.compile("\r\n|\r|\n")
+
+
+def _default_equal(sdist_value: object, wheel_value: object) -> bool:
+    return sdist_value == wheel_value
+
+
+def _unfold(value: object) -> object:
+    """Undo RFC 5322 header folding so refolded headers compare equal."""
+    if isinstance(value, str):
+        return _HEADER_FOLD_RE.sub("", value)
+    if isinstance(value, list):
+        return [_unfold(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _unfold(item) for key, item in value.items()}
+    return value
+
+
+def _comparison_view(
+    raw: RawMetadata, unparsed: dict[str, list[str]]
+) -> dict[str, Any]:
+    """Merge parsed and unparsed fields into one name -> value mapping."""
+    view: dict[str, Any] = dict(raw)
+    for email_name, values in unparsed.items():
+        raw_name = _EMAIL_TO_RAW_MAPPING.get(email_name, email_name)
+        # Unparsed values are opaque; keep their raw header spellings.
+        view.setdefault(raw_name, values)
+    for raw_name, value in view.items():
+        # The description may come from the message body, where line breaks
+        # are content rather than folding artifacts, so leave it alone.
+        if raw_name != "description":
+            view[raw_name] = _unfold(value)
+    return view
+
+
+def compare_metadata(
+    sdist_metadata: bytes | str, wheel_metadata: bytes | str
+) -> MetadataComparison:
+    """Compare sdist ``PKG-INFO`` metadata against wheel ``METADATA`` metadata.
+
+    This checks whether building a wheel from the sdist honoured the static
+    field commitments of the core metadata specification: any field *not*
+    declared ``Dynamic`` in the sdist must be reproduced identically in the
+    wheel. Comparison is purely syntactic/semantic over the two metadata
+    documents; no build backend is invoked.
+
+    Fields are compared according to their semantics rather than bytewise:
+    ``Name`` and ``Provides-Extra`` are normalized, ``Version`` is parsed,
+    and ``Requires-Dist`` entries are parsed and compared as an unordered
+    collection. Header folding differences therefore never register as
+    changes.
+
+    If the sdist's metadata version predates 2.2 (when ``Dynamic`` was
+    introduced) or is missing/invalid, there is not enough information to
+    judge and the result is :attr:`ComparisonStatus.UNKNOWN` rather than
+    silently assumed compatible.
+    """
+    sdist_raw, sdist_unparsed = parse_email(sdist_metadata)
+    wheel_raw, wheel_unparsed = parse_email(wheel_metadata)
+
+    sdist_fields = _comparison_view(sdist_raw, sdist_unparsed)
+    wheel_fields = _comparison_view(wheel_raw, wheel_unparsed)
+
+    metadata_version = sdist_raw.get("metadata_version")
+    dynamic: tuple[str, ...] = ()
+    invalid_dynamic: tuple[str, ...] = ()
+    dynamic_allowed: frozenset[str] = frozenset()
+
+    if not isinstance(metadata_version, str) or (
+        metadata_version not in _VALID_METADATA_VERSIONS
+    ):
+        reason = (
+            f"sdist metadata version {metadata_version!r} is missing or invalid; "
+            "static field commitments cannot be determined"
+        )
+        metadata_version_out = (
+            metadata_version if isinstance(metadata_version, str) else None
+        )
+        unknown = True
+    elif _VALID_METADATA_VERSIONS.index(
+        metadata_version
+    ) < _VALID_METADATA_VERSIONS.index("2.2"):
+        reason = (
+            f"metadata version {metadata_version} predates Dynamic (metadata 2.2); "
+            "there is not enough information to determine which fields were "
+            "allowed to change"
+        )
+        metadata_version_out = metadata_version
+        unknown = True
+    else:
+        declared = [field.lower() for field in sdist_raw.get("dynamic", [])]
+        dynamic = tuple(declared)
+        invalid_dynamic = tuple(
+            field
+            for field in declared
+            if field in _NEVER_DYNAMIC_FIELDS or field not in _EMAIL_TO_RAW_MAPPING
+        )
+        dynamic_allowed = frozenset(declared) - frozenset(invalid_dynamic)
+        reason = ""
+        metadata_version_out = metadata_version
+        unknown = False
+
+    changes: list[FieldChange] = []
+    for raw_name in sorted(set(sdist_fields) | set(wheel_fields)):
+        # Dynamic is the declaration mechanism itself, not a committed value.
+        if raw_name == "dynamic":
+            continue
+        field = _RAW_TO_EMAIL_MAPPING.get(raw_name, raw_name)
+        in_sdist = raw_name in sdist_fields
+        in_wheel = raw_name in wheel_fields
+        sdist_value = sdist_fields.get(raw_name)
+        wheel_value = wheel_fields.get(raw_name)
+        if in_sdist and in_wheel:
+            comparator = _FIELD_COMPARATORS.get(raw_name, _default_equal)
+            if comparator(sdist_value, wheel_value):
+                continue
+            kind = ChangeKind.CHANGED
+        elif in_wheel:
+            kind = ChangeKind.ADDED
+        else:
+            kind = ChangeKind.REMOVED
+
+        allowed = field in dynamic_allowed
+        if unknown:
+            change_reason = (
+                f"{field!r} differs, but the sdist metadata version does not "
+                "say whether it was allowed to"
+            )
+        elif allowed:
+            change_reason = f"{field!r} is declared Dynamic in the sdist metadata"
+        else:
+            change_reason = (
+                f"{field!r} is not declared Dynamic in the sdist metadata "
+                f"(Metadata-Version {metadata_version_out})"
+            )
+        changes.append(
+            FieldChange(
+                field=field,
+                kind=kind,
+                sdist_value=sdist_value,
+                wheel_value=wheel_value,
+                allowed=allowed,
+                reason=change_reason,
+            )
+        )
+
+    if unknown:
+        status = ComparisonStatus.UNKNOWN
+    elif invalid_dynamic:
+        status = ComparisonStatus.VIOLATED
+        reason = "illegal Dynamic usage: " + ", ".join(
+            repr(field) for field in invalid_dynamic
+        )
+    elif any(not change.allowed for change in changes):
+        status = ComparisonStatus.VIOLATED
+        reason = "static fields differ between the sdist and wheel metadata"
+    else:
+        status = ComparisonStatus.COMPATIBLE
+        reason = "all non-Dynamic fields are identical"
+
+    return MetadataComparison(
+        status=status,
+        metadata_version=metadata_version_out,
+        dynamic=dynamic,
+        invalid_dynamic=invalid_dynamic,
+        changes=tuple(changes),
+        reason=reason,
+    )

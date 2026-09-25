@@ -56,6 +56,26 @@ Low Level Interface
 .. autoclass:: packaging.metadata.RFC822Policy
 
 
+Comparing sdist and wheel metadata
+''''''''''''''''''''''''''''''''''
+
+.. autofunction:: packaging.metadata.compare_metadata
+
+.. autoclass:: packaging.metadata.MetadataComparison
+    :members:
+
+.. autoclass:: packaging.metadata.FieldChange
+    :members:
+
+.. autoclass:: packaging.metadata.ComparisonStatus
+    :members:
+    :undoc-members:
+
+.. autoclass:: packaging.metadata.ChangeKind
+    :members:
+    :undoc-members:
+
+
 Exceptions
 ''''''''''
 
