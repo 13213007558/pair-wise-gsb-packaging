@@ -32,6 +32,7 @@ The ``packaging`` library uses calendar-based versioning (``YY.N``).
     metadata
     tags
     pylock
+    wheel
     direct_url
     dependency_groups
     errors
