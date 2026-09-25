@@ -4,6 +4,12 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`packaging.wheel.validate_wheel`, a read-only consistency
+  check for wheel archives (filename, dist-info, METADATA, WHEEL, and
+  RECORD verification) that reports an independent list of issues.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
