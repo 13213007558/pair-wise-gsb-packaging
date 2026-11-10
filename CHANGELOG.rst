@@ -4,6 +4,16 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`packaging.source.verify_source`, an offline interface that
+  verifies whether the ``direct_url`` recorded for an installed package proves
+  it came from an approved VCS reference or archive. It distinguishes
+  immutable VCS ``commit_id`` and archive digests from movable
+  ``requested_revision`` branches/tags and mutable local directories,
+  normalizes URLs, subdirectories, and project names, hides credentials in
+  reports, and never mutates its inputs.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)

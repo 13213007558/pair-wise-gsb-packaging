@@ -33,6 +33,7 @@ The ``packaging`` library uses calendar-based versioning (``YY.N``).
     tags
     pylock
     direct_url
+    source
     dependency_groups
     errors
     utils
