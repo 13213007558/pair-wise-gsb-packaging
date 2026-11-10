@@ -20,6 +20,7 @@ exists.
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import enum
 import typing
 from typing import (
@@ -56,7 +57,7 @@ if TYPE_CHECKING:
     from .specifiers import SpecifierSet
 
 
-__all__ = ["RangeRelation", "VersionRange"]
+__all__ = ["RangeDifference", "RangeRelation", "VersionRange", "difference_witness"]
 
 T = TypeVar("T")
 UnparsedVersion = Version | str
@@ -453,6 +454,407 @@ def _format_intervals(intervals: Sequence[Interval]) -> str:
     return " | ".join(
         f"{_format_lower(lower)}, {_format_upper(upper)}" for lower, upper in intervals
     )
+
+
+# Witness selection for set differences. A witness is one concrete value that
+# lies in one range and outside the other. It is always re-checked through both
+# ranges' ``contains`` before it is returned, so these builders only have to
+# produce candidates in the right neighborhood; the membership test has the
+# final word. The selection is deterministic and never enumerates a version
+# index: each bound contributes the handful of structural neighbors PEP 440
+# places next to it (its dev/pre/post/local family).
+
+#: The witness offered for a difference made only of arbitrary non-version
+#: strings (a live ``admit_arbitrary`` flag). Not a PEP 440 version, so the
+#: bounds can never admit it and only the flag decides.
+_ARBITRARY_WITNESS = "wat"
+
+
+def _successor_above(version: Version) -> Version:
+    """A valid PEP 440 version strictly greater than *version*.
+
+    Prefers the nearest structural successor so the result stays inside the
+    version's own family: a dev bump for a dev release, the next pre-release's
+    ``.dev0`` for a pre-release, and the first ``.post0.dev0`` otherwise.
+    """
+    if version.dev is not None:
+        return version.__replace__(dev=version.dev + 1, local=None)
+    if version.pre is not None:
+        kind, number = version.pre
+        return version.__replace__(
+            pre=(kind, number + 1), post=None, dev=0, local=None
+        )
+    return version.__replace__(post=0, dev=0, local=None)
+
+
+def _predecessor_below(version: Version) -> Version:
+    """A valid PEP 440 version strictly less than *version*."""
+    if version.local is not None:
+        segments = version.local.split(".")
+        if len(segments) > 1:
+            return version.__replace__(local=".".join(segments[:-1]))
+        return version.__replace__(local=None)
+    if version.dev is not None:
+        if version.dev >= 1:
+            return version.__replace__(dev=version.dev - 1)
+        return version.__replace__(dev=None)
+    if version.post is not None:
+        if version.post >= 1:
+            return version.__replace__(post=version.post - 1, dev=None)
+        return version.__replace__(post=None, dev=None)
+    if version.pre is not None:
+        kind, number = version.pre
+        if number >= 1:
+            return version.__replace__(pre=(kind, number - 1), post=None, dev=None)
+        return version.__replace__(pre=None, post=None, dev=0)
+    # A plain final: the family's first dev release sorts just below it.
+    return version.__replace__(dev=0)
+
+
+def _lower_bound_candidates(bound: LowerBound) -> list[Version]:
+    """Deterministic candidate members at or just above *bound*."""
+    value = bound.version
+    if value is None:
+        return [MIN_VERSION]
+    if isinstance(value, BoundaryVersion):
+        successor = least_version_above(value)
+        if successor is not None:
+            return [successor]
+        if value.kind is BoundaryKind.AFTER_POSTS:
+            # ``>V`` on a final has no least successor: every ``V.postN`` stays
+            # inside the boundary's family. A numeric sub-release sorts above it
+            # while an upper bound may still cap the interval inside the same
+            # prefix (the gap ``(>0, 1.dev0)`` holds ``0.1``); beyond it the next
+            # prefix's own ``.dev0`` is the first member.
+            base = value.version
+            family = trim_release(base.release)
+            sub_release = (*base.release, 1)
+            next_release = (*family[:-1], family[-1] + 1)
+            return [
+                Version.from_parts(epoch=base.epoch, release=sub_release),
+                Version.from_parts(epoch=base.epoch, release=next_release, dev=0),
+            ]
+        # An AFTER_LOCALS boundary always has a least successor.
+        return [_successor_above(value.version)]
+    if bound.inclusive:
+        return [value]
+    return [_successor_above(value)]
+
+
+def _upper_bound_candidates(bound: UpperBound) -> list[Version]:
+    """Deterministic candidate members at or just below *bound*."""
+    value = bound.version
+    if value is None:
+        return []
+    if isinstance(value, BoundaryVersion):
+        if bound.inclusive:
+            # The boundary spans the base version's whole local family, whose
+            # members share one public version; label the base locally.
+            return [value.version.__replace__(local="0")]
+        successor = least_version_above(value)
+        return [successor] if successor is not None else []
+    if bound.inclusive:
+        # An inclusive plain-version upper admits the version's local family
+        # only through a boundary-equivalent specifier (``==V``, ``<=V``), not
+        # a raw bound; offer the labeled member so a literal that rejects the
+        # family still yields a witness.
+        return [value, value.__replace__(local="0")]
+    return [_predecessor_below(value)]
+
+
+def _lower_bound_prerelease_candidates(bound: LowerBound) -> list[Version]:
+    """Deterministic pre-release candidates at or just above *bound*.
+
+    The ordinary lower candidates are usually final releases, so a
+    pre-release-only difference needs its own set: the boundary's least
+    successor when it is itself a pre-release, otherwise the nearest pre-release
+    above the base version.
+    """
+    value = bound.version
+    if value is None:
+        return [MIN_VERSION]
+    if isinstance(value, BoundaryVersion):
+        successor = least_version_above(value)
+        if successor is not None:
+            return [successor] if successor.is_prerelease else []
+        if value.kind is BoundaryKind.AFTER_POSTS:
+            base = value.version
+            if base.pre is not None:
+                kind, number = base.pre
+                return [
+                    base.__replace__(
+                        pre=(kind, number + 1), post=None, dev=0, local=None
+                    )
+                ]
+            family = trim_release(base.release)
+            return [
+                Version.from_parts(
+                    epoch=base.epoch, release=(*base.release, 1), pre=("a", 1)
+                ),
+                Version.from_parts(
+                    epoch=base.epoch,
+                    release=(*family[:-1], family[-1] + 1),
+                    dev=0,
+                ),
+            ]
+        # AFTER_LOCALS: the least successor is a .devN or a post .dev0.
+        return [_successor_above(value.version)]
+    if bound.inclusive:
+        if value.is_prerelease:
+            return [value]
+        return [value.__replace__(post=0, dev=0, local=None)]
+    successor = _successor_above(value)
+    return [successor] if successor.is_prerelease else []
+
+
+def _upper_bound_prerelease_candidates(bound: UpperBound) -> list[Version]:
+    """Deterministic pre-release candidates at or just below *bound*."""
+    value = bound.version
+    if value is None:
+        return []
+    if isinstance(value, BoundaryVersion):
+        successor = least_version_above(value)
+        return [successor] if successor is not None and successor.is_prerelease else []
+    if bound.inclusive:
+        return [value] if value.is_prerelease else []
+    predecessor = _predecessor_below(value)
+    if predecessor.is_prerelease:
+        return [predecessor]
+    candidate = predecessor.__replace__(dev=0)
+    return [candidate] if candidate.is_prerelease else []
+
+
+def _interval_candidates(
+    lower: LowerBound, upper: UpperBound, *, prerelease: bool
+) -> list[Version]:
+    """Stable, de-duplicated candidate members for one non-empty interval."""
+    if prerelease:
+        lower_candidates = _lower_bound_prerelease_candidates(lower)
+        upper_candidates = _upper_bound_prerelease_candidates(upper)
+    else:
+        lower_candidates = _lower_bound_candidates(lower)
+        upper_candidates = _upper_bound_candidates(upper)
+    candidates: list[Version] = []
+    for candidate in (*lower_candidates, *upper_candidates):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _witness_in_interval(
+    lower: LowerBound, upper: UpperBound, *, prerelease: bool
+) -> Version | None:
+    """The least in-bounds candidate of one interval, or ``None``.
+
+    With ``prerelease`` false any PEP 440 version will do; with it true only a
+    pre-release is accepted, and an interval that holds none returns ``None``.
+    """
+    if range_is_empty(lower, upper):
+        return None
+    for candidate in _interval_candidates(lower, upper, prerelease=prerelease):
+        if prerelease and not candidate.is_prerelease:
+            continue
+        above = lower._above
+        below = upper._below
+        if (above is None or above(candidate)) and (
+            below is None or below(candidate)
+        ):
+            return candidate
+    return None
+
+
+def _iter_interval_members(bounds: Sequence[Interval]) -> Iterator[Version]:
+    """Stable candidate members across intervals, ordinary then pre-release.
+
+    Every in-bounds candidate is yielded rather than just the first witness: a
+    difference carried only by membership rules (a ``===`` literal rejecting the
+    ``V+local`` family, or the pre-release policy) can split a later candidate
+    even when the first one is admitted identically. No version index is
+    enumerated; each bound only contributes its structural neighbors.
+    """
+    for prerelease in (False, True):
+        for lower, upper in bounds:
+            if range_is_empty(lower, upper):
+                continue
+            for candidate in _interval_candidates(
+                lower, upper, prerelease=prerelease
+            ):
+                if prerelease and not candidate.is_prerelease:
+                    continue
+                above = lower._above
+                below = upper._below
+                if (above is None or above(candidate)) and (
+                    below is None or below(candidate)
+                ):
+                    yield candidate
+
+
+def _first_interval_witness(
+    bounds: Sequence[Interval], *, prerelease: bool
+) -> Version | None:
+    """The first interval's witness, scanning intervals in ascending order."""
+    for lower, upper in bounds:
+        witness = _witness_in_interval(lower, upper, prerelease=prerelease)
+        if witness is not None:
+            return witness
+    return None
+
+
+def _difference_bounds(
+    left: VersionRange, right: VersionRange
+) -> tuple[Interval, ...]:
+    """The interval set of ``left - right`` independent of either policy."""
+    return tuple(_difference_ranges(left._bounds, right._bounds))
+
+
+def _literal_witness(
+    old: VersionRange, new: VersionRange, *, added: bool
+) -> str | None:
+    """A ``===`` literal the two ranges decide differently, or ``None``.
+
+    Every literal each range names explicitly is a candidate; admission through
+    the bounds alone needs no literal handling and is covered by the interval
+    witnesses. The caller re-checks membership, so ordering is the only concern.
+    """
+    for literal in sorted(old._admit | old._reject | new._admit | new._reject):
+        old_has = old.contains(literal)
+        new_has = new.contains(literal)
+        if added and new_has and not old_has:
+            return literal
+        if not added and old_has and not new_has:
+            return literal
+    return None
+
+
+def _arbitrary_witness(
+    old: VersionRange, new: VersionRange, *, added: bool
+) -> str | None:
+    """The fixed non-version string when only the arbitrary flag differs."""
+    if new._arbitrary_active() != old._arbitrary_active():
+        witness = _ARBITRARY_WITNESS
+        old_has = old.contains(witness)
+        new_has = new.contains(witness)
+        if added and new_has and not old_has:
+            return witness
+        if not added and old_has and not new_has:
+            return witness
+    return None
+
+
+def _find_witness(
+    old: VersionRange, new: VersionRange, *, added: bool
+) -> Version | str | None:
+    """One concrete value in one range but not the other, or ``None``.
+
+    The structural interval difference is searched first for its least member.
+    That member can still be admitted identically (a ``===V`` literal and
+    ``==V`` agree on ``V`` itself but split on ``V+local``; two ranges can agree
+    on every final yet split on a pre-release policy), so the minuend's own
+    bounds are then scanned for any candidate the two membership tests disagree
+    on. Explicit ``===`` literals and the arbitrary-string flag follow. Every
+    candidate is verified through both ranges' :meth:`contains` before it is
+    returned; ``None`` means the difference has no member under the policy.
+    """
+    minuend = new if added else old
+    subtrahend = old if added else new
+    bounds = _difference_bounds(minuend, subtrahend)
+
+    def admitted_differently(candidate: Version | str) -> bool:
+        """Whether *candidate* is a witness in the requested direction."""
+        in_new = new.contains(candidate)
+        in_old = old.contains(candidate)
+        return in_new and not in_old if added else in_old and not in_new
+
+    witness = _first_interval_witness(bounds, prerelease=False)
+    if witness is not None and admitted_differently(witness):
+        return witness
+
+    for candidate in _iter_interval_members(minuend._bounds):
+        if admitted_differently(candidate):
+            return candidate
+
+    literal = _literal_witness(old, new, added=added)
+    if literal is not None:
+        return literal
+
+    return _arbitrary_witness(old, new, added=added)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RangeDifference:
+    """Witness values for the difference between two :class:`VersionRange` sets.
+
+    Each non-``None`` field is one concrete value that passes membership in one
+    range but not the other, under the policy the witnesses were selected with.
+    A field is ``None`` exactly when that direction of the difference has no
+    member: nothing was newly admitted, or nothing was newly rejected.
+
+    :attr:`added` holds a value the new range accepts and the old range rejects;
+    :attr:`removed` holds one the old range accepts and the new range rejects.
+    A value is a :class:`~packaging.version.Version` when the difference is
+    expressed by the interval bounds, and a plain string when it is a ``===``
+    literal or an arbitrary non-version string admitted only by a full range.
+
+    .. versionadded:: 26.4
+    """
+
+    added: Version | str | None
+    removed: Version | str | None
+
+
+def difference_witness(
+    old: VersionRange,
+    new: VersionRange,
+    prereleases: bool | None = None,
+) -> RangeDifference:
+    """Return concrete witnesses for what changed between two ranges.
+
+    A security review that sees an admission range widen via
+    :meth:`VersionRange.relation` still needs an actual value the new rule
+    accepts and the old rule rejected. This function produces one:
+    :attr:`RangeDifference.added` names a value accepted by *new* and rejected
+    by *old*, and :attr:`RangeDifference.removed` names one accepted by *old*
+    and rejected by *new*. Either side is ``None`` precisely when that
+    difference is empty, so equal ranges report ``RangeDifference(None, None)``.
+
+    Witnesses are derived from the ranges' own interval boundaries and literal
+    sets, never by downloading or enumerating a package index's version list.
+    Each returned value is independently re-checked through
+    :meth:`VersionRange.contains` on both original ranges with the given
+    *prereleases* policy before it is returned, so a difference that cannot be
+    spelled as a single :class:`~packaging.specifiers.SpecifierSet` still
+    yields a witness as long as it has a member.
+
+    :param old: the range the policy previously applied.
+    :param new: the range the policy applies after the change.
+    :param prereleases: the membership policy used to select and verify the
+        witnesses. ``None`` uses each range's own configured policy, so ranges
+        carrying different pre-release policies can be compared directly and
+        the policy change itself produces a pre-release witness; ``True`` or
+        ``False`` applies that policy to both ranges uniformly.
+    :raises TypeError: if an operand is not a :class:`VersionRange`.
+
+    >>> old_range = SpecifierSet(">=1.0,<2.0").to_range()
+    >>> new_range = SpecifierSet(">=1.0,<3.0").to_range()
+    >>> difference_witness(old_range, new_range)
+    RangeDifference(added=<Version('2.0.dev0')>, removed=None)
+    >>> new_range.contains("2.0.dev0") and not old_range.contains("2.0.dev0")
+    True
+
+    .. versionadded:: 26.4
+    """
+    if not isinstance(old, VersionRange) or not isinstance(new, VersionRange):
+        raise TypeError(
+            "difference_witness() expects two VersionRange operands, got "
+            f"{type(old).__name__} and {type(new).__name__}"
+        )
+
+    old_view = old if prereleases is None else old._with_prereleases(prereleases)
+    new_view = new if prereleases is None else new._with_prereleases(prereleases)
+
+    added = _find_witness(old_view, new_view, added=True)
+    removed = _find_witness(old_view, new_view, added=False)
+    return RangeDifference(added=added, removed=removed)
 
 
 # ``to_specifier_set`` recovery: encode a range's interval list back into
@@ -1254,6 +1656,30 @@ class VersionRange:
             pre_region=pre_region,
             prereleases_configured=configured,
         )
+
+    def _with_prereleases(self, prereleases: bool | None) -> VersionRange:
+        """A copy whose configured policy matches an explicit membership policy.
+
+        An explicit True/False governs globally, so the copy carries it as its
+        configured policy and drops the autodetected opt-in region, mirroring
+        :meth:`contains` with that argument. ``None`` returns the range itself.
+        """
+        if prereleases is None or prereleases == self._prereleases_configured:
+            return self
+        return self._with_policy(pre_region=(), configured=prereleases)
+
+    def difference_witness(
+        self, other: VersionRange, prereleases: bool | None = None
+    ) -> RangeDifference:
+        """Witness values for the difference between this range and *other*.
+
+        Delegates to :func:`difference_witness` with this range as the old
+        policy and *other* as the new one; see that function for the semantics
+        of the witnesses and the *prereleases* argument.
+
+        .. versionadded:: 26.4
+        """
+        return difference_witness(self, other, prereleases)
 
     @classmethod
     def empty(cls, *, prereleases: bool | None = None) -> VersionRange:

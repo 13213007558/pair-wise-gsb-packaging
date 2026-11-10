@@ -4,6 +4,20 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`packaging.ranges.difference_witness` and the
+  :meth:`~packaging.ranges.VersionRange.difference_witness` method, returning a
+  :class:`~packaging.ranges.RangeDifference` with one concrete witness for each
+  direction of a change between two :class:`~packaging.ranges.VersionRange`
+  sets: a value the new range accepts and the old one rejects, and one the old
+  range accepts and the new one rejects. A side is ``None`` exactly when that
+  difference is empty. Witnesses are derived from the ranges' own bounds and
+  ``===`` literals and re-checked through ``contains`` on both original ranges,
+  so open and closed boundaries, epochs, dev/pre/post and local segments,
+  arbitrary ``===`` strings, and pre-release policy changes each produce a
+  witness without enumerating a package index.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)

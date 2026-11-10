@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import operator
 from typing import TYPE_CHECKING
 
@@ -2922,3 +2923,268 @@ class TestFromBounds:
         assert VersionRange.from_bounds("0.dev0") == VersionRange.full(
             admit_arbitrary=False
         )
+
+
+class TestDifferenceWitness:
+    """Witnesses for the two directions of a range change.
+
+    Every non-``None`` witness is independently re-checked through both
+    original ranges' ``contains``; a ``None`` field means that difference
+    genuinely has no member.
+    """
+
+    def _assert_witness(
+        self,
+        old: VersionRange,
+        new: VersionRange,
+        result: ranges.RangeDifference,
+        prereleases: bool | None = None,
+    ) -> None:
+        if result.added is not None:
+            assert new.contains(result.added, prereleases)
+            assert not old.contains(result.added, prereleases)
+        if result.removed is not None:
+            assert old.contains(result.removed, prereleases)
+            assert not new.contains(result.removed, prereleases)
+
+    @pytest.mark.parametrize(
+        ("old_spec", "new_spec", "field", "expected"),
+        [
+            # An open upper moved outward admits the first version above it.
+            (">=1.0,<2.0", ">=1.0,<3.0", "added", "2.0.dev0"),
+            # The reverse move rejects that same value.
+            (">=1.0,<3.0", ">=1.0,<2.0", "removed", "2.0.dev0"),
+            # An open lower moved inward rejects the release it used to admit.
+            (">=1.0", ">=1.5", "removed", "1.0"),
+            # Closing the upper still starts at the dev release just below it,
+            # the least member of the widened band.
+            (">=1.0,<2.0", ">=1.0,<=2.0", "added", "2.0.dev0"),
+        ],
+    )
+    def test_open_and_closed_boundaries(
+        self, old_spec: str, new_spec: str, field: str, expected: str
+    ) -> None:
+        old, new = vr(old_spec), vr(new_spec)
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert getattr(result, field) == Version(expected)
+        opposite = "removed" if field == "added" else "added"
+        assert getattr(result, opposite) is None
+
+    def test_adjacent_dev_release_boundary(self) -> None:
+        # >1.0a1 and >=1.0a2.dev0 are the same canonical range, so no witness
+        # exists even though they are spelled with adjacent dev boundaries.
+        old, equivalent = vr(">1.0a1"), vr(">=1.0a2.dev0")
+        assert old == equivalent
+        assert ranges.difference_witness(old, equivalent) == (
+            ranges.RangeDifference(None, None)
+        )
+
+        # Tightening the lower from 1.0a2.dev0 up to 1.0a2 rejects the dev
+        # release that sat between the two adjacent boundaries.
+        old, new = vr(">=1.0a2.dev0"), vr(">=1.0a2")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.removed == Version("1.0a2.dev0")
+        assert result.added is None
+
+    def test_wildcard_exclusion_segment(self) -> None:
+        # Dropping a !=P.* exclusion admits the prefix's first dev release.
+        old, new = vr(">=1.0,!=1.2.*"), vr(">=1.0")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == Version("1.2.dev0")
+        assert result.removed is None
+
+        # Adding the exclusion rejects it again.
+        reversed_result = ranges.difference_witness(new, old)
+        self._assert_witness(new, old, reversed_result)
+        assert reversed_result.removed == Version("1.2.dev0")
+        assert reversed_result.added is None
+
+    def test_epoch_boundary(self) -> None:
+        old, new = vr(">=1!2.0"), vr(">=1!1.0")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added is not None
+        assert result.added == Version("1!1.0")
+        assert result.removed is None
+
+    def test_local_only_difference(self) -> None:
+        # Widening ==1.0+local to ==1.0 admits the unlabeled public version;
+        # the only change between them is the local label.
+        old, new = vr("==1.0+local"), vr("==1.0")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == Version("1.0")
+        assert result.removed is None
+
+    def test_strict_singleton_local_family(self) -> None:
+        # The strict singleton {1.0} excludes the local family ==1.0 admits.
+        old, new = VersionRange.singleton("1.0"), vr("==1.0")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == Version("1.0+0")
+        assert result.removed is None
+
+    def test_arbitrary_equality_rejects_local_family(self) -> None:
+        # ===V matches one string; ==V also admits every V+local. The witness
+        # cannot be a literal (none names the local version), so it is built
+        # from the shared interval's local family.
+        old, new = vr("===1.0"), vr("==1.0")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == Version("1.0+0")
+        assert new.contains("1.0+anything")
+        assert not old.contains("1.0+anything")
+        assert result.removed is None
+
+        reverse = ranges.difference_witness(new, old)
+        self._assert_witness(new, old, reverse)
+        assert reverse.removed == Version("1.0+0")
+        assert reverse.added is None
+
+    def test_arbitrary_string_literal_swap(self) -> None:
+        old, new = vr("===not-a-version"), vr("===other-string")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == "other-string"
+        assert result.removed == "not-a-version"
+
+    def test_arbitrary_string_literal_added_and_dropped(self) -> None:
+        old, new = VersionRange.empty(), vr("===legacy")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == "legacy"
+        assert result.removed is None
+
+        reverse = ranges.difference_witness(new, old)
+        self._assert_witness(new, old, reverse)
+        assert reverse.removed == "legacy"
+        assert reverse.added is None
+
+    def test_non_canonical_pep440_literal(self) -> None:
+        # A string PEP 440 itself rejects still travels through === verbatim.
+        old, new = vr("===1.0-rc1"), vr("===1.0rc1")
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == "1.0rc1"
+        assert result.removed == "1.0-rc1"
+
+    def test_case_folded_literal_is_no_change(self) -> None:
+        old, new = vr("===Foo"), vr("===foo")
+        assert old == new
+        assert ranges.difference_witness(old, new) == ranges.RangeDifference(
+            None, None
+        )
+
+    def test_full_range_arbitrary_string_flag(self) -> None:
+        versions_only = VersionRange.full(admit_arbitrary=False)
+        arbitrary = VersionRange.full()
+        result = ranges.difference_witness(versions_only, arbitrary)
+        self._assert_witness(versions_only, arbitrary, result)
+        assert result.added == "wat"
+        assert result.removed is None
+
+        reverse = ranges.difference_witness(arbitrary, versions_only)
+        self._assert_witness(arbitrary, versions_only, reverse)
+        assert reverse.removed == "wat"
+
+    def test_prerelease_policy_change_adds_a_pre_release(self) -> None:
+        old = vr(">=1.0,<2.0", prereleases=False)
+        new = vr(">=1.0,<2.0", prereleases=True)
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added is not None
+        assert isinstance(result.added, Version)
+        assert result.added.is_prerelease
+        assert result.removed is None
+
+    def test_prerelease_policy_change_removes_a_pre_release(self) -> None:
+        old = vr(">=1.0,<2.0", prereleases=True)
+        new = vr(">=1.0,<2.0", prereleases=False)
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.removed is not None
+        assert isinstance(result.removed, Version)
+        assert result.removed.is_prerelease
+        assert result.added is None
+
+    def test_explicit_prereleases_argument_overrides_both_policies(self) -> None:
+        permissive = vr(">=1.0,<2.0", prereleases=True)
+        strict = vr(">=1.0,<2.0", prereleases=False)
+
+        # Viewed under one uniform policy the bounds decide identically, so no
+        # witness exists even though the configured policies differ.
+        for policy in (True, False):
+            result = ranges.difference_witness(permissive, strict, policy)
+            self._assert_witness(permissive, strict, result, policy)
+            assert result == ranges.RangeDifference(None, None)
+
+        # Without the override the policy change itself is the difference.
+        default_view = ranges.difference_witness(strict, permissive)
+        assert default_view.added is not None
+        assert default_view.removed is None
+
+    def test_contains_not_filter_decides_the_witness(self) -> None:
+        # Under the autodetected default filter() buffers then flushes this
+        # pre-release, but contains() admits it regardless; the witness search
+        # uses contains, so a default range and a prereleases=True range agree
+        # on it and report no change.
+        default_range = vr(">=1.0,<2.0")
+        permissive = vr(">=1.0,<2.0", prereleases=True)
+        assert list(default_range.filter(["1.5a1"])) == ["1.5a1"]
+        assert default_range.contains("1.5a1") is permissive.contains("1.5a1")
+        assert ranges.difference_witness(
+            default_range, permissive
+        ) == ranges.RangeDifference(None, None)
+
+    def test_no_change_control_returns_empty_conclusion(self) -> None:
+        # Equal ranges, including empty ones, must never invent a witness.
+        assert ranges.difference_witness(vr(">=1.0,<2.0"), vr(">=1.0,<2.0")) == (
+            ranges.RangeDifference(None, None)
+        )
+        assert ranges.difference_witness(
+            vr(">=2,<1"), vr(">=3,<1")
+        ) == ranges.RangeDifference(None, None)
+        assert ranges.difference_witness(
+            VersionRange.empty(), VersionRange.empty()
+        ) == ranges.RangeDifference(None, None)
+
+    def test_difference_with_no_specifier_set_spelling_still_witnessed(self) -> None:
+        # A disjoint union has no single SpecifierSet spelling, yet each gap has
+        # members the narrower range lacks.
+        old = vr(">=1.0,<2.0")
+        new = old | vr(">=3.0,<4.0")
+        assert new.to_specifier_set() is None
+        result = ranges.difference_witness(old, new)
+        self._assert_witness(old, new, result)
+        assert result.added == Version("3.0")
+        assert result.removed is None
+
+    def test_witness_is_deterministic(self) -> None:
+        old, new = vr(">=1.0,<2.0,!=1.5"), vr(">=1.0,<3.0")
+        first = ranges.difference_witness(old, new)
+        for _ in range(5):
+            assert ranges.difference_witness(old, new) == first
+        assert hash(first) == hash(ranges.difference_witness(old, new))
+
+    def test_method_delegates_to_function(self) -> None:
+        old, new = vr(">=1.0,<2.0"), vr(">=1.0,<3.0")
+        assert old.difference_witness(new) == ranges.difference_witness(old, new)
+
+    @pytest.mark.parametrize("bad_old", [None, 1, ">=1.0", object()])
+    @pytest.mark.parametrize("bad_new", [None, 1, ">=1.0", object()])
+    def test_non_range_operand_raises(
+        self, bad_old: object, bad_new: object
+    ) -> None:
+        good = vr(">=1.0")
+        with pytest.raises(TypeError):
+            ranges.difference_witness(bad_old, good)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            ranges.difference_witness(good, bad_new)  # type: ignore[arg-type]
+
+    def test_result_is_frozen(self) -> None:
+        result = ranges.RangeDifference(added=Version("1.0"), removed=None)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.added = None  # type: ignore[misc]

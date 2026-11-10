@@ -232,6 +232,79 @@ Relating two ranges
     >>> VersionRange.empty().relation(b)
     RangeRelation.EMPTY
 
+Witnessing a range change
+-------------------------
+
+:meth:`VersionRange.relation` says that an admission range grew, but not which
+value the new rule accepts and the old one rejected. A security review report
+wants that concrete value, so :func:`difference_witness` returns one for each
+direction of the change. :attr:`~RangeDifference.added` is a value the new range
+accepts and the old range rejects; :attr:`~RangeDifference.removed` is one the
+old range accepts and the new range rejects. A field is ``None`` exactly when
+that difference is empty, so unchanged ranges report ``None`` on both sides:
+
+.. doctest::
+
+    >>> from packaging.ranges import difference_witness
+    >>> old = SpecifierSet(">=1.0,<2.0").to_range()
+    >>> new = SpecifierSet(">=1.0,<3.0").to_range()
+    >>> difference_witness(old, new)
+    RangeDifference(added=<Version('2.0.dev0')>, removed=None)
+
+Every witness is derived from the ranges' own interval boundaries and ``===``
+literals, never by downloading or enumerating a package index's version list,
+and is independently re-checked through :meth:`VersionRange.contains` on both
+original ranges. A difference that cannot be written as one
+:class:`~packaging.specifiers.SpecifierSet` still yields a witness as long as it
+has a member. The same holds for a disjoint union, which has no single-set
+spelling:
+
+.. doctest::
+
+    >>> widened = new | SpecifierSet(">=4.0,<5.0").to_range()
+    >>> widened.to_specifier_set() is None
+    True
+    >>> difference_witness(old, widened)
+    RangeDifference(added=<Version('2.0.dev0')>, removed=None)
+
+The search understands open and closed endpoints, epochs, dev/pre/post and
+local segments, and the arbitrary strings a ``===`` operator names. A
+``===`` literal matches one string while ``==V`` also admits the ``V+local``
+family, so the witness is the local variant neither literal spells out:
+
+.. doctest::
+
+    >>> difference_witness(
+    ...     SpecifierSet("===1.0").to_range(), SpecifierSet("==1.0").to_range()
+    ... )
+    RangeDifference(added=<Version('1.0+0')>, removed=None)
+    >>> difference_witness(
+    ...     SpecifierSet("===legacy").to_range(), VersionRange.empty()
+    ... )
+    RangeDifference(added=None, removed='legacy')
+
+The optional ``prereleases`` argument selects the membership policy the
+witnesses are checked under. Left at ``None``, each range uses its own
+configured policy, so changing the policy itself produces a pre-release
+witness; passing ``True`` or ``False`` applies one policy to both ranges, in
+which case identical bounds report no difference. This is a
+:meth:`~VersionRange.contains` rule for a single value, not the pre-release
+buffering :meth:`VersionRange.filter` applies to a candidate set:
+
+.. doctest::
+
+    >>> strict = SpecifierSet(">=1.0,<2.0", prereleases=False).to_range()
+    >>> permissive = SpecifierSet(">=1.0,<2.0", prereleases=True).to_range()
+    >>> difference_witness(strict, permissive)
+    RangeDifference(added=<Version('1.0.post0.dev0')>, removed=None)
+    >>> difference_witness(strict, permissive, prereleases=True)
+    RangeDifference(added=None, removed=None)
+
+:meth:`VersionRange.difference_witness` is the method form, taking the other
+range as its argument with the receiver acting as the old rule.
+
+.. versionadded:: 26.4
+
 Snapping onto known versions
 ----------------------------
 
