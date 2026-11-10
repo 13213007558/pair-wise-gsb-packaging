@@ -4,6 +4,18 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :func:`~packaging.metadata_diff.diff_metadata` and the
+  :class:`~packaging.metadata_diff.MetadataDifferenceReport`,
+  :class:`~packaging.metadata_diff.FieldDifference` and
+  :class:`~packaging.metadata_diff.DifferenceStatus` types for comparing the
+  core metadata of an sdist's ``PKG-INFO`` against a wheel's ``METADATA``
+  without executing build code. The comparison applies the ``Dynamic``
+  semantics of the sdist's ``Metadata-Version`` and uses field-specific
+  semantics (name normalization, PEP 440 version spelling, requirement and
+  marker parsing) rather than comparing raw text.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
