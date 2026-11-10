@@ -20,7 +20,7 @@ from .specifiers import InvalidSpecifier, Specifier
 from .utils import canonicalize_name
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 __all__ = [
     "Environment",
@@ -323,6 +323,22 @@ def _evaluate_markers(
             raise TypeError(f"Unexpected marker {marker!r}")
 
     return any(all(item) for item in groups)
+
+
+def _marker_environment_keys(markers: MarkerList) -> frozenset[str]:
+    """Collect the environment variable names referenced by a marker."""
+
+    def walk(nodes: MarkerList) -> Iterator[str]:
+        for node in nodes:
+            if isinstance(node, list):
+                yield from walk(node)
+            elif isinstance(node, tuple):
+                lhs, _op, rhs = node
+                for operand in (lhs, rhs):
+                    if isinstance(operand, Variable):
+                        yield operand.value
+
+    return frozenset(walk(markers))
 
 
 def _format_full_version(info: sys._version_info) -> str:

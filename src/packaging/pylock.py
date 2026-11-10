@@ -24,7 +24,10 @@ from urllib.parse import unquote, urlparse
 from .markers import (
     Environment,
     Marker,
+    _evaluate_markers,
+    _marker_environment_keys,
     _pep440_python_full_version,
+    _repair_python_full_version,
     default_environment,
 )
 from .specifiers import SpecifierSet
@@ -36,7 +39,7 @@ from .utils import (
     parse_sdist_filename,
     parse_wheel_filename,
 )
-from .version import Version
+from .version import InvalidVersion, Version
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Collection, Iterator
@@ -321,6 +324,175 @@ class PylockSelectError(Exception):
 
     .. versionadded:: 26.1
     """
+
+
+# Known mappings between the ``implementation_name`` and
+# ``platform_python_implementation`` marker variables. An unknown pair is not
+# rejected, since implementations packaging does not know about may exist.
+_IMPLEMENTATION_NAMES: Mapping[str, str] = {
+    "cpython": "CPython",
+    "pypy": "PyPy",
+    "jython": "Jython",
+    "ironpython": "IronPython",
+    "graalpy": "GraalPy",
+    "rustpython": "RustPython",
+}
+
+# Coherent values for the operating-system related marker variables. When
+# ``sys_platform`` is given, the other two values must match this mapping.
+_PLATFORM_TRIPLES: Mapping[str, tuple[str, str]] = {
+    "linux": ("posix", "Linux"),
+    "darwin": ("posix", "Darwin"),
+    "win32": ("nt", "Windows"),
+    "cygwin": ("posix", "CYGWIN_NT"),
+    "emscripten": ("posix", "Emscripten"),
+    "wasi": ("posix", "wasi"),
+    "aix": ("posix", "AIX"),
+    "freebsd": ("posix", "FreeBSD"),
+    "openbsd": ("posix", "OpenBSD"),
+    "netbsd": ("posix", "NetBSD"),
+    "dragonfly": ("posix", "DragonFly"),
+    "haiku": ("posix", "Haiku"),
+    "sunos5": ("posix", "SunOS"),
+}
+
+
+def _validate_target_environment(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate an explicit target marker environment for cross-environment use.
+
+    Only the values actually provided are checked; nothing is filled in from
+    the host. Obvious internal contradictions between related marker variables
+    raise :class:`PylockSelectError`.
+    """
+    target: dict[str, str] = {}
+    for key, value in environment.items():
+        if not isinstance(value, str):  # pragma: no cover - typing guarantee
+            raise TypeError(
+                f"environment value for {key!r} must be a str, "
+                f"not {type(value).__name__}"
+            )
+        target[key] = value
+
+    full_version = target.get("python_full_version")
+    short_version = target.get("python_version")
+    if full_version is not None:
+        try:
+            parsed_full_version = Version(full_version)
+        except InvalidVersion:
+            raise PylockSelectError(
+                f"python_full_version {full_version!r} in provided target "
+                f"environment is not a valid PEP 440 version"
+            ) from None
+        if short_version is not None:
+            derived_short_version = (
+                f"{parsed_full_version.major}.{parsed_full_version.minor}"
+            )
+            if derived_short_version != short_version:
+                raise PylockSelectError(
+                    f"Contradictory target Python description: "
+                    f"python_version {short_version!r} does not match "
+                    f"python_full_version {full_version!r} "
+                    f"(which implies python_version == {derived_short_version!r})"
+                )
+
+    implementation_name = target.get("implementation_name")
+    platform_implementation = target.get("platform_python_implementation")
+    if (
+        implementation_name is not None
+        and platform_implementation is not None
+        and (expected_implementation := _IMPLEMENTATION_NAMES.get(implementation_name))
+        is not None
+        and platform_implementation != expected_implementation
+    ):
+        raise PylockSelectError(
+            f"Contradictory target Python description: "
+            f"implementation_name {implementation_name!r} implies "
+            f"platform_python_implementation {expected_implementation!r}, "
+            f"but {platform_implementation!r} was provided"
+        )
+
+    if (
+        implementation_name == "cpython"
+        and full_version is not None
+        and (implementation_version := target.get("implementation_version")) is not None
+    ):
+        try:
+            parsed_implementation_version = Version(implementation_version)
+        except InvalidVersion:
+            raise PylockSelectError(
+                f"implementation_version {implementation_version!r} in provided "
+                f"target environment is not a valid PEP 440 version"
+            ) from None
+        if (
+            parsed_implementation_version.major,
+            parsed_implementation_version.minor,
+        ) != (Version(full_version).major, Version(full_version).minor):
+            raise PylockSelectError(
+                f"Contradictory target Python description: "
+                f"implementation_version {implementation_version!r} does not "
+                f"share its major.minor with python_full_version "
+                f"{full_version!r} for a CPython target"
+            )
+
+    sys_platform = target.get("sys_platform")
+    os_name = target.get("os_name")
+    platform_system = target.get("platform_system")
+    if (
+        sys_platform is not None
+        and (expected_platform := _PLATFORM_TRIPLES.get(sys_platform)) is not None
+    ):
+        expected_os_name, expected_platform_system = expected_platform
+        if os_name is not None and os_name != expected_os_name:
+            raise PylockSelectError(
+                f"Contradictory target Python description: "
+                f"sys_platform {sys_platform!r} implies os_name "
+                f"{expected_os_name!r}, but {os_name!r} was provided"
+            )
+        if platform_system is not None and platform_system != expected_platform_system:
+            raise PylockSelectError(
+                f"Contradictory target Python description: "
+                f"sys_platform {sys_platform!r} implies platform_system "
+                f"{expected_platform_system!r}, but {platform_system!r} was provided"
+            )
+    elif os_name is not None and platform_system is not None:
+        coherent_pairs = set(_PLATFORM_TRIPLES.values())
+        if (os_name, platform_system) not in coherent_pairs:
+            raise PylockSelectError(
+                f"Contradictory target Python description: "
+                f"os_name {os_name!r} and platform_system {platform_system!r} "
+                f"do not describe a known operating system"
+            )
+
+    return target
+
+
+def _strict_evaluate_marker(
+    marker: Marker,
+    environment: Mapping[str, Any],
+    *,
+    location: str,
+) -> bool:
+    """Evaluate a marker solely against the provided target environment.
+
+    Unlike :meth:`Marker.evaluate`, this never consults
+    :func:`default_environment`, so a variable referenced by the marker but
+    absent from the target is an error naming the field and the expression
+    rather than silently being read from the host.
+    """
+    missing = sorted(_marker_environment_keys(marker._markers) - environment.keys())
+    if missing:
+        raise PylockSelectError(
+            f"Target environment is missing {', '.join(repr(key) for key in missing)} "
+            f"required to evaluate marker {str(marker)!r} in {location!r}; "
+            f"provide the value(s) explicitly instead of relying on the host "
+            f"environment"
+        )
+    evaluation_env = dict(environment)
+    if "python_full_version" in evaluation_env:
+        evaluation_env = _repair_python_full_version(evaluation_env)
+    return _evaluate_markers(marker._markers, evaluation_env)
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -641,7 +813,7 @@ class Pylock:
             | PackageSdist,
         ]
     ]:
-        """Select what to install from the lock file.
+        """Select what to install from the lock file for the current machine.
 
         The *environment* and *tags* parameters represent the environment being
         selected for. If unspecified, ``packaging.markers.default_environment()`` and
@@ -657,6 +829,11 @@ class Pylock:
         before attempting wheel compatibility. If no source distribution is
         available, wheel selection proceeds as usual without calling the predicate.
 
+        This is a convenience method for selecting for the running interpreter.
+        When selecting for a different machine (for example, a release build that
+        publishes artifacts for several target systems), use
+        :meth:`select_for_target`, which never falls back to host-derived values.
+
         This method must be used on valid Pylock instances (i.e. one obtained
         from :meth:`Pylock.from_dict` or if constructed manually, after calling
         :meth:`Pylock.validate`).
@@ -669,6 +846,129 @@ class Pylock:
         .. versionchanged:: 26.4
             Raise :class:`PylockSelectError` if passed extras or dependency groups
             that are not declared in the corresponding pylock fields.
+        """
+        resolved_tags: Sequence[Tag] = list(sys_tags()) if tags is None else tags
+        base_environment: dict[str, str] = dict(
+            cast("Mapping[str, str]", environment or default_environment())
+        )
+        evaluation_environment = self._build_selection_environment(
+            base_environment,
+            extras,
+            dependency_groups,
+        )
+        python_full_version = _pep440_python_full_version(
+            base_environment["python_full_version"]
+        )
+
+        def evaluate_marker(
+            marker: Marker,
+            marker_environment: Mapping[str, Any],
+            *,
+            location: str,
+        ) -> bool:
+            return marker.evaluate(
+                marker_environment,
+                context="requirement" if location == "environments" else "lock_file",
+            )
+
+        yield from self._select_artifacts(
+            tags=resolved_tags,
+            base_environment=base_environment,
+            evaluation_environment=evaluation_environment,
+            python_full_version=python_full_version,
+            prefer_sdist_predicate=prefer_sdist_predicate,
+            evaluate_marker=evaluate_marker,
+        )
+
+    def select_for_target(
+        self,
+        *,
+        environment: Environment | Mapping[str, str],
+        tags: Sequence[Tag],
+        extras: Collection[str] | None = None,
+        dependency_groups: Collection[str] | None = None,
+        prefer_sdist_predicate: Callable[[NormalizedName], bool] | None = None,
+    ) -> Iterator[
+        tuple[
+            Package,
+            PackageVcs
+            | PackageDirectory
+            | PackageArchive
+            | PackageWheel
+            | PackageSdist,
+        ]
+    ]:
+        """Strictly select what to install for an explicitly described target.
+
+        Unlike :meth:`select`, this entry point performs no host introspection
+        at all: it never calls ``packaging.markers.default_environment()`` or
+        ``packaging.tags.sys_tags()``. The target marker *environment* and the
+        priority-ordered compatible *tags* are therefore both required keyword
+        arguments, and the same description drives every decision: the
+        lock-level ``environments`` and ``requires-python``, each package's
+        ``marker`` and ``requires-python``, and wheel tag matching.
+
+        Only the environment variables actually referenced by the evaluated
+        markers need to be provided, but any referenced variable that is
+        missing raises :class:`PylockSelectError` naming the field and the
+        marker expression instead of being silently filled in from the build
+        machine. The target description is also checked for obvious internal
+        contradictions (such as a ``python_version`` that does not match
+        ``python_full_version``).
+
+        The set semantics for *extras* and *dependency_groups* follow the
+        pylock convention: ``dependency_groups=None`` selects the lock file's
+        default groups, while an explicit empty collection selects no groups;
+        extras not declared in the lock file's ``extras`` field and groups not
+        declared in ``dependency-groups`` or ``default-groups`` are errors.
+
+        :raises PylockSelectError: if the target description is contradictory
+            or incomplete, the lock file does not apply to the target, the
+            same package name is selected more than once, no artifact matches
+            the target, or an unknown extra or group is requested.
+
+        .. versionadded:: 26.4
+        """
+        base_environment = _validate_target_environment(
+            cast("Mapping[str, str]", environment)
+        )
+        evaluation_environment = self._build_selection_environment(
+            base_environment,
+            extras,
+            dependency_groups,
+        )
+
+        def evaluate_marker(
+            marker: Marker,
+            marker_environment: Mapping[str, Any],
+            *,
+            location: str,
+        ) -> bool:
+            return _strict_evaluate_marker(
+                marker,
+                marker_environment,
+                location=location,
+            )
+
+        yield from self._select_artifacts(
+            tags=tags,
+            base_environment=base_environment,
+            evaluation_environment=evaluation_environment,
+            python_full_version=None,
+            prefer_sdist_predicate=prefer_sdist_predicate,
+            evaluate_marker=evaluate_marker,
+        )
+
+    def _build_selection_environment(
+        self,
+        base_environment: Mapping[str, str],
+        extras: Collection[str] | None,
+        dependency_groups: Collection[str] | None,
+    ) -> dict[str, str | frozenset[str]]:
+        """Resolve extras and dependency groups into a marker environment.
+
+        ``dependency_groups=None`` means the default groups apply; an explicit
+        empty collection means no groups apply.
         """
         canonical_extras = {canonicalize_name(extra) for extra in extras or ()}
         unknown_extras = canonical_extras - set(self.extras or ())
@@ -694,20 +994,16 @@ class Pylock:
                 f"{', '.join(sorted(unknown_dependency_groups))}"
             )
 
-        compatible_tags_selector = create_compatible_tags_selector(
-            tags if tags is not None else sys_tags()
-        )
-
         # #. Gather the extras and dependency groups to install and set ``extras`` and
         #    ``dependency_groups`` for marker evaluation, respectively.
         #
         #    #. ``extras`` SHOULD be set to the empty set by default.
         #    #. ``dependency_groups`` SHOULD be the set created from
         #       :ref:`pylock-default-groups` by default.
-        env = cast(
+        evaluation_environment = cast(
             "dict[str, str | frozenset[str]]",
             dict(
-                environment or {},  # Marker.evaluate will fill-up
+                base_environment,
                 extras=frozenset(canonical_extras),
                 dependency_groups=frozenset(
                     (self.default_groups or [])
@@ -716,11 +1012,52 @@ class Pylock:
                 ),
             ),
         )
-        env_python_full_version = _pep440_python_full_version(
-            environment["python_full_version"]
-            if environment
-            else default_environment()["python_full_version"]
-        )
+        return evaluation_environment
+
+    def _resolve_python_full_version(
+        self,
+        base_environment: Mapping[str, str],
+        python_full_version: str | None,
+        *,
+        specifier: SpecifierSet,
+        location: str,
+    ) -> str:
+        """Get the target's ``python_full_version`` for a requires-python check.
+
+        In strict mode the value is taken from the target description and its
+        absence is an error naming the field rather than a host lookup.
+        """
+        if python_full_version is not None:
+            return python_full_version
+        if "python_full_version" not in base_environment:
+            raise PylockSelectError(
+                "Target environment is missing 'python_full_version' required to "
+                f"evaluate requires-python {str(specifier)!r} in {location!r}; "
+                "provide the value explicitly instead of relying on the host "
+                "environment"
+            )
+        return _pep440_python_full_version(base_environment["python_full_version"])
+
+    def _select_artifacts(
+        self,
+        *,
+        tags: Sequence[Tag],
+        base_environment: Mapping[str, str],
+        evaluation_environment: Mapping[str, Any],
+        python_full_version: str | None,
+        prefer_sdist_predicate: Callable[[NormalizedName], bool] | None,
+        evaluate_marker: Callable[..., bool],
+    ) -> Iterator[
+        tuple[
+            Package,
+            PackageVcs
+            | PackageDirectory
+            | PackageArchive
+            | PackageWheel
+            | PackageSdist,
+        ]
+    ]:
+        compatible_tags_selector = create_compatible_tags_selector(tags)
 
         # #. Check if the metadata version specified by :ref:`pylock-lock-version` is
         #    supported; an error or warning MUST be raised as appropriate.
@@ -729,22 +1066,29 @@ class Pylock:
         # #. If :ref:`pylock-requires-python` is specified, check that the environment
         #    being installed for meets the requirement; an error MUST be raised if it is
         #    not met.
-        if self.requires_python and not self.requires_python.contains(
-            env_python_full_version,
-        ):
-            raise PylockSelectError(
-                f"python_full_version {env_python_full_version!r} "
-                f"in provided environment does not satisfy the Python version "
-                f"requirement {str(self.requires_python)!r}"
+        if self.requires_python:
+            target_python_full_version = self._resolve_python_full_version(
+                base_environment,
+                python_full_version,
+                specifier=self.requires_python,
+                location="requires-python",
             )
+            if not self.requires_python.contains(target_python_full_version):
+                raise PylockSelectError(
+                    f"python_full_version {target_python_full_version!r} "
+                    f"in provided environment does not satisfy the Python version "
+                    f"requirement {str(self.requires_python)!r}"
+                )
 
         # #. If :ref:`pylock-environments` is specified, check that at least one of the
         #    environment marker expressions is satisfied; an error MUST be raised if no
         #    expression is satisfied.
         if self.environments is not None:
             for env_marker in self.environments:
-                if env_marker.evaluate(
-                    cast("dict[str, str]", environment or {}), context="requirement"
+                if evaluate_marker(
+                    env_marker,
+                    base_environment,
+                    location="environments",
                 ):
                     break
             else:
@@ -758,20 +1102,29 @@ class Pylock:
         for package_index, package in enumerate(self.packages):
             # #. If :ref:`pylock-packages-marker` is specified, check if it is
             #    satisfied;if it isn't, skip to the next package.
-            if package.marker and not package.marker.evaluate(env, context="lock_file"):
+            if package.marker and not evaluate_marker(
+                package.marker,
+                evaluation_environment,
+                location=f"packages[{package_index}].marker",
+            ):
                 continue
 
             # #. If :ref:`pylock-packages-requires-python` is specified, check if it is
             #    satisfied; an error MUST be raised if it isn't.
-            if package.requires_python and not package.requires_python.contains(
-                env_python_full_version,
-            ):
-                raise PylockSelectError(
-                    f"python_full_version {env_python_full_version!r} "
-                    f"in provided environment does not satisfy the Python version "
-                    f"requirement {str(package.requires_python)!r} for package "
-                    f"{package.name!r} at packages[{package_index}]"
+            if package.requires_python:
+                target_python_full_version = self._resolve_python_full_version(
+                    base_environment,
+                    python_full_version,
+                    specifier=package.requires_python,
+                    location=f"packages[{package_index}].requires-python",
                 )
+                if not package.requires_python.contains(target_python_full_version):
+                    raise PylockSelectError(
+                        f"python_full_version {target_python_full_version!r} "
+                        f"in provided environment does not satisfy the Python version "
+                        f"requirement {str(package.requires_python)!r} for package "
+                        f"{package.name!r} at packages[{package_index}]"
+                    )
 
             # #. Check that no other conflicting instance of the package has been slated
             #    to be installed; an error about the ambiguity MUST be raised otherwise.

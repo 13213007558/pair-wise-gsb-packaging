@@ -55,6 +55,55 @@ Usage
     for package, artifact in pylock.select():
         print(f"Install {package.name} from {artifact}")
 
+Selecting for another machine
+------------------------------
+
+:meth:`Pylock.select` defaults the marker environment and compatible tags to
+the running interpreter, which is convenient for local installs. A release
+build that publishes artifacts for several target systems must not let the
+build machine leak into the target description. Use
+:meth:`Pylock.select_for_target` instead: both the target marker environment
+and the priority-ordered compatible tags are required keyword arguments, and
+the method never calls :func:`packaging.markers.default_environment` or
+:func:`packaging.tags.sys_tags`.
+
+.. code-block:: python
+
+    from packaging.tags import Tag
+
+    target_environment = {
+        "implementation_name": "cpython",
+        "implementation_version": "3.12.7",
+        "os_name": "posix",
+        "platform_machine": "x86_64",
+        "platform_release": "6.8.0",
+        "platform_system": "Linux",
+        "platform_version": "#1 SMP",
+        "python_full_version": "3.12.7",
+        "platform_python_implementation": "CPython",
+        "python_version": "3.12",
+        "sys_platform": "linux",
+    }
+    target_tags = [
+        Tag("cp312", "cp312", "manylinux_2_17_x86_64"),
+        Tag("py3", "none", "any"),
+    ]
+
+    for package, artifact in pylock.select_for_target(
+        environment=target_environment,
+        tags=target_tags,
+    ):
+        print(f"Install {package.name} from {artifact}")
+
+Only the marker variables actually referenced by the lock file need to be
+present. If a referenced variable is missing, :class:`PylockSelectError`
+names the field and the marker expression rather than silently reading the
+host value. The target description is also checked for obvious internal
+contradictions, such as a ``python_version`` that disagrees with
+``python_full_version``. The ``extras`` and ``dependency_groups`` arguments
+follow the pylock convention: ``dependency_groups=None`` selects the lock
+file's default groups, while an explicit empty collection selects no groups.
+
 Validation
 ----------
 

@@ -1,0 +1,67 @@
+# A short lock file spanning Linux/Windows and CPython 3.11/3.12 targets.
+lock-version = '1.0'
+environments = ['sys_platform == "linux"', 'sys_platform == "win32"']
+requires-python = '>=3.11,<3.13'
+created-by = 'cross-platform-tests'
+extras = ['native']
+dependency-groups = ['test']
+default-groups = ['test']
+
+# Unconditional pure-Python wheel; every target gets the same artifact.
+[[packages]]
+name = 'tomli-w'
+version = '1.2.0'
+
+    [[packages.wheels]]
+    name = 'tomli_w-1.2.0-py3-none-any.whl'
+    url = 'https://example.invalid/tomli_w-1.2.0-py3-none-any.whl'
+    hashes = {sha256 = '0000000000000000000000000000000000000000000000000000000000000000'}
+
+# Platform-specific package with one wheel per target plus an sdist fallback.
+[[packages]]
+name = 'speedup'
+version = '4.2.1'
+marker = 'sys_platform == "linux" and python_version == "3.12"'
+
+    [[packages.wheels]]
+    name = 'speedup-4.2.1-cp312-cp312-manylinux_2_17_x86_64.whl'
+    url = 'https://example.invalid/speedup-4.2.1-cp312-cp312-manylinux_2_17_x86_64.whl'
+    hashes = {sha256 = '1111111111111111111111111111111111111111111111111111111111111111'}
+
+[[packages]]
+name = 'speedup'
+version = '4.2.1'
+marker = 'sys_platform == "linux" and python_version == "3.11"'
+
+    [[packages.wheels]]
+    name = 'speedup-4.2.1-cp311-cp311-manylinux_2_17_x86_64.whl'
+    url = 'https://example.invalid/speedup-4.2.1-cp311-cp311-manylinux_2_17_x86_64.whl'
+    hashes = {sha256 = '2222222222222222222222222222222222222222222222222222222222222222'}
+
+[[packages]]
+name = 'speedup'
+version = '4.2.1'
+marker = 'sys_platform == "win32"'
+
+    [[packages.wheels]]
+    name = 'speedup-4.2.1-py3-none-win_amd64.whl'
+    url = 'https://example.invalid/speedup-4.2.1-py3-none-win_amd64.whl'
+    hashes = {sha256 = '3333333333333333333333333333333333333333333333333333333333333333'}
+
+    [packages.sdist]
+    path = 'speedup-4.2.1.tar.gz'
+    hashes = {sha256 = '4444444444444444444444444444444444444444444444444444444444444444'}
+
+# Extras-gated package.
+[[packages]]
+name = 'speedup-native'
+version = '4.2.1'
+marker = "'native' in extras"
+directory = {path = './speedup-native'}
+
+# Dependency-group-gated package; selected by default via default-groups.
+[[packages]]
+name = 'speedup-tests'
+version = '4.2.1'
+marker = "'test' in dependency_groups"
+directory = {path = './speedup-tests'}

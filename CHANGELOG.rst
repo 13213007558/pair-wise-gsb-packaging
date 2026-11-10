@@ -4,6 +4,17 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add ``Pylock.select_for_target()`` as a strict cross-environment entry
+  point. It requires an explicit target marker environment and priority-
+  ordered compatible tags, never consults
+  ``packaging.markers.default_environment()`` or
+  ``packaging.tags.sys_tags()``, reports missing referenced environment
+  fields with the marker expression that needs them, and rejects target
+  descriptions with obvious internal contradictions. The existing
+  ``Pylock.select()`` host convenience method is unchanged.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
